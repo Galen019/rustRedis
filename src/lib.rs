@@ -37,7 +37,7 @@ impl Server {
     /// A client that connects and never sends anything holds its thread until it goes away
     pub fn serve(self) -> io::Result<()> {
         loop {
-            let (mut stream, _) = match self.listener.accept() {
+            let (mut stream, peer) = match self.listener.accept() {
                 Ok(accepted) => accepted,
                 Err(e) if is_transient(&e) => {
                     eprintln!("accept failed (transient, continuing): {e}");
@@ -48,18 +48,16 @@ impl Server {
                 Err(e) => return Err(e),
             };
 
-            // Disable Nagle because it adds ~40ms of latency to small request/response pairs.
-            if let Err(e) = stream.set_nodelay(true) {
-                eprintln!("failed to set TCP_NODELAY: {e}");
-                continue;
-            }
+            // Disable Nagle because it adds ~40ms of latency to small
+            // request/response pairs. Latency tweak, not correctness: if it
+            // fails, echo anyway.
+            let _ = stream.set_nodelay(true);
 
-            let peer = peer_addr(&stream);
             eprintln!("accepted connection from {peer}");
 
             if let Err(e) = thread::Builder::new().spawn(move || {
                 if let Err(e) = handle_connection(&mut stream) {
-                    eprintln!("connection error from {}: {e}", peer_addr(&stream));
+                    eprintln!("connection error from {peer}: {e}");
                 }
             }) {
                 eprintln!("failed to spawn connection thread from {peer}: {e}");
@@ -88,11 +86,4 @@ fn is_transient(e: &io::Error) -> bool {
         e.kind(),
         ErrorKind::ConnectionAborted | ErrorKind::Interrupted
     )
-}
-
-fn peer_addr(stream: &TcpStream) -> String {
-    stream
-        .peer_addr()
-        .map(|addr| addr.to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string())
 }
