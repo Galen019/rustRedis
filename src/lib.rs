@@ -1,7 +1,17 @@
-//! A minimal blocking, thread-per-connection TCP server.
+//! A minimal blocking, thread-per-connection TCP server, plus the in-memory
+//! store it will eventually serve.
 //!
-//! This is the socket plumbing only: it accepts connections and echoes every
-//! byte back, verbatim, until the client closes its write half. No protocol.
+//! Two layers that do not talk to each other yet:
+//!
+//! - [`Server`] is the socket plumbing: it accepts connections and echoes every
+//!   byte back, verbatim, until the client closes its write half. No protocol.
+//! - [`Store`] is the data layer: a shared, binary-safe key/value map with no
+//!   TTL. It is reachable only from Rust code; putting it on the wire needs RESP
+//!   parsing and a command layer, neither of which exists yet.
+
+mod store;
+
+pub use store::Store;
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
