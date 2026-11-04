@@ -8,9 +8,9 @@ use rust_redis::Server;
 /// Generous, but finite: a regression must fail, not hang `cargo test`.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Binds a real listener on an ephemeral port and serves it from a detached
-/// thread. The listener already exists when this returns, so clients can
-/// connect immediately with no sleep or retry.
+/// Binds port 0 and serves from a detached thread.
+///
+/// - the listener is live before return, so no sleep or retry is needed
 fn start_server() -> SocketAddr {
     let server = Server::bind("127.0.0.1:0").expect("bind");
     let addr = server.local_addr().expect("local_addr");
@@ -70,17 +70,25 @@ fn echo_round_trip_and_concurrent_clients() {
     assert_eq!(round_trip(&mut b, b"still here"), b"still here");
 }
 
-/// The connection handler reads in fixed-size chunks, so anything past the
-/// first chunk must still come back verbatim.
+/// A payload spanning many read chunks round-trips verbatim.
 #[test]
 fn echoes_payloads_larger_than_the_read_buffer() {
     let mut stream = connect(start_server());
     let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
-    assert_eq!(round_trip(&mut stream, &payload), payload);
+
+    // Read from a clone while writing; a single large write can deadlock.
+    let mut writer = stream.try_clone().expect("clone stream");
+    let len = payload.len();
+    let reader = thread::spawn(move || {
+        let mut echoed = vec![0u8; len];
+        stream.read_exact(&mut echoed).expect("read echo");
+        echoed
+    });
+    writer.write_all(&payload).expect("write");
+    assert_eq!(reader.join().expect("reader thread panicked"), payload);
 }
 
-/// Each write is echoed as it arrives; the server must not wait for the client
-/// to disconnect before replying.
+/// Each write is echoed as it arrives, not after disconnect.
 #[test]
 fn echoes_each_write_as_it_arrives() {
     let mut stream = connect(start_server());

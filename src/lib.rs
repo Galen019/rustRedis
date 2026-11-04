@@ -1,13 +1,7 @@
-//! A minimal blocking, thread-per-connection TCP server, plus the in-memory
-//! store it will eventually serve.
+//! Blocking, thread-per-connection TCP echo server.
 //!
-//! Two layers that do not talk to each other yet:
-//!
-//! - [`Server`] is the socket plumbing: it accepts connections and echoes every
-//!   byte back, verbatim, until the client closes its write half. No protocol.
-//! - [`Store`] is the data layer: a shared, binary-safe key/value map with no
-//!   TTL. It is reachable only from Rust code; putting it on the wire needs RESP
-//!   parsing and a command layer, neither of which exists yet.
+//! - [`Server`]: socket plumbing
+//! - [`Store`]: in-memory key/value map, not yet on the wire
 
 mod store;
 
@@ -18,17 +12,15 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::thread;
 
 /// A bound TCP listener that has not started accepting yet.
-///
-/// Binding and serving are separate so callers can read the actually-bound
-/// address (see [`Server::local_addr`]) *before* the accept loop starts, which
-/// is what makes port `0` usable in tests without retries or sleeps.
 pub struct Server {
     listener: TcpListener,
 }
 
 impl Server {
-    /// Binds `addr`, e.g. `"127.0.0.1:6379"` or `"127.0.0.1:0"` for a
-    /// kernel-assigned port. The library never hardcodes an address.
+    /// Binds `addr` without accepting.
+    ///
+    /// - `"127.0.0.1:0"` asks the kernel for a free port
+    /// - read it with [`Server::local_addr`] before [`Server::serve`]
     pub fn bind(addr: &str) -> io::Result<Self> {
         Ok(Self {
             listener: TcpListener::bind(addr)?,
@@ -42,9 +34,9 @@ impl Server {
 
     /// Accepts connections forever.
     ///
-    /// Each connection is handled on a detached thread
-    /// killing the process severs every in-flight connection
-    /// A client that connects and never sends anything holds its thread until it goes away
+    /// - one detached thread per connection
+    /// - a silent client holds its thread until it disconnects
+    /// - transient accept errors are retried; others end the loop
     pub fn serve(self) -> io::Result<()> {
         loop {
             let (mut stream, peer) = match self.listener.accept() {
@@ -53,14 +45,12 @@ impl Server {
                     eprintln!("accept failed (transient, continuing): {e}");
                     continue;
                 }
-                // Anything else (fd exhaustion, broken listener) would turn
-                // into a hot stderr-spamming loop if we continued.
+                // Other errors (fd exhaustion, broken listener) would hot-loop on stderr.
                 Err(e) => return Err(e),
             };
 
-            // Disable Nagle because it adds ~40ms of latency to small
-            // request/response pairs. Latency tweak, not correctness: if it
-            // fails, echo anyway.
+            // Best-effort Nagle disable: ~40ms less latency on small round trips.
+            // A failure is not fatal; echo with Nagle on.
             let _ = stream.set_nodelay(true);
 
             eprintln!("accepted connection from {peer}");
@@ -76,7 +66,7 @@ impl Server {
     }
 }
 
-/// Echoes bytes back until the peer closes its write half.
+/// Echoes each read back until the peer half-closes.
 fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
     let mut buf = [0u8; 4096];
     loop {

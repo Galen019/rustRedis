@@ -6,7 +6,7 @@ A minimal TCP server in Rust, built as a learning foundation for a Redis-like se
 
 - Binds `127.0.0.1:6379` and accepts connections forever: blocking `std::net`, one detached thread per connection, no deps, no async runtime.
 - Echoes every byte a client sends back, verbatim, until the client closes its write half.
-- An in-memory key/value store (`src/store.rs`): `get`, `set`, `del`, `exists` over binary-safe `Vec<u8>` keys and `Arc<[u8]>` values, backed by a single `RwLock<HashMap<_, _>>` shared across connection threads as `Arc<Store>`. No TTL. **Nothing on the network can call it yet.**
+- An in-memory key/value store (`src/store.rs`): `get`, `set`, `del`, `exists` over binary-safe `Vec<u8>` keys and `Arc<[u8]>` values, backed by a single `RwLock<HashMap<_, _>>`, shareable across connection threads as `Arc<Store>`. No TTL. **Nothing on the network can call it yet.**
 
 ## Run it
 

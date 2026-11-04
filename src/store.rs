@@ -1,40 +1,32 @@
-//! In-memory, binary-safe key/value storage: no TTL, no value types, no
-//! persistence.
+//! Binary-safe in-memory key/value store.
 //!
-//! One `RwLock<HashMap<Vec<u8>, Arc<[u8]>>>` is shared by every connection
-//! thread, so readers run concurrently and writers are exclusive. [`Store`] is
-//! not `Clone`; callers hold `Arc<Store>` and clone that.
-//!
-//! Keys and values are unbounded, an empty key is valid, empty value is present value.
-//! 
-//! [`Store::get`] hands back an owned `Arc<[u8]>` instead of a borrow
-//! because the read lock cannot outlive the call, result is a snapshot
-//! and stays valid if the key is deleted or overwritten
+//! - one `RwLock<HashMap<Vec<u8>, Arc<[u8]>>>`, shareable as `Arc<Store>`
+//! - no TTL, persistence, or value types
+//! - a poisoned lock panics
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-/// A shared, in-memory map from byte keys to byte values.
+type Map = HashMap<Vec<u8>, Arc<[u8]>>;
+
+/// Shared map from byte keys to byte values.
+#[derive(Default)]
 pub struct Store {
-    inner: RwLock<HashMap<Vec<u8>, Arc<[u8]>>>,
+    inner: RwLock<Map>,
 }
 
 impl Store {
     /// Creates an empty store.
     pub fn new() -> Self {
-        Self {
-            inner: RwLock::new(HashMap::new()),
-        }
+        Self::default()
     }
 
-    /// Returns the value for `key`, or `None` if it is absent.
+    /// Returns a snapshot of the value for `key`, or `None` if it is absent.
     pub fn get(&self, key: &[u8]) -> Option<Arc<[u8]>> {
         self.read().get(key).cloned()
     }
 
     /// Inserts or replaces the value for `key`.
-    ///
-    /// Replacing reports nothing
     pub fn set(&self, key: &[u8], value: &[u8]) {
         self.write().insert(key.to_vec(), Arc::from(value));
     }
@@ -49,20 +41,13 @@ impl Store {
         self.read().contains_key(key)
     }
 
-    // A panic while the lock was held poisons it: another thread died
-    // mid-write, so the map may be inconsistent. Recovering would serve that
-    // corruption silently, which is worse than dying loudly here.
-    fn read(&self) -> RwLockReadGuard<'_, HashMap<Vec<u8>, Arc<[u8]>>> {
+    // A panic while the lock is held poisons it: another thread may have died
+    // mid-write, so recovering could serve corruption silently.
+    fn read(&self) -> RwLockReadGuard<'_, Map> {
         self.inner.read().expect("store lock poisoned")
     }
 
-    fn write(&self) -> RwLockWriteGuard<'_, HashMap<Vec<u8>, Arc<[u8]>>> {
+    fn write(&self) -> RwLockWriteGuard<'_, Map> {
         self.inner.write().expect("store lock poisoned")
-    }
-}
-
-impl Default for Store {
-    fn default() -> Self {
-        Self::new()
     }
 }
