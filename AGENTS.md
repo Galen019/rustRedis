@@ -21,7 +21,7 @@ Learning project: a Redis-like server built in deliberate milestones. Read this 
 
 ## Layout
 
-- `src/lib.rs` — `Server { listener, store }`: `bind`, `local_addr`, `serve`. Thread-per-connection, TCP_NODELAY best-effort, transient accept errors retried. The connection loop is `read_request` → `execute` → `encode` into a reused buffer → one `write_all` per request; `Executed::close` and clean EOF end it.
+- `src/lib.rs` — `Server { listener, store }`: `bind`, `local_addr`, `serve`. Thread-per-connection, TCP_NODELAY best-effort, transient accept errors retried. The connection loop is `read_request` → `execute` → `encode` into a reused buffer → one `write_all` per request; `Executed::close` and clean EOF end it with a `Disconnected` reason, which `serve` logs as exactly one line per connection end.
 - `src/resp.rs` — `Reply` and `encode`; `read_request` over any `BufRead`; `ProtocolError`/`RequestError`; the three caps. Header reads are capped with `Read::take` because `read_until` grows without bound; bulk payloads grow with received bytes; error text escapes peer bytes.
 - `src/command.rs` — `execute(&Store, &[Vec<u8>]) -> Option<Executed>`; `Executed { reply, close }` pairs a frame with whether the connection closes. Socket-free: name matching (ASCII case-insensitive), arity checks, store access. `None` means "no reply" (`*0`).
 - `src/store.rs` — `Store`: `RwLock<HashMap<Vec<u8>, Arc<[u8]>>>`. Binary-safe keys/values, empty key and empty value are valid. `get` returns an owned `Arc<[u8]>` snapshot; `del_many`/`exists_many` accept any iterator of key slices and hold one guard each, so a batch is a snapshot. `Store` is not `Clone` (share an `Arc<Store>`). A poisoned lock panics deliberately.

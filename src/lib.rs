@@ -44,7 +44,7 @@ impl Server {
     /// Accepts connections forever.
     ///
     /// - one detached thread per connection, all sharing the store
-    /// - a silent client holds its thread until it disconnects
+    /// - each connection end is logged once with its reason
     /// - transient accept errors are retried; others end the loop
     pub fn serve(self) -> io::Result<()> {
         loop {
@@ -65,38 +65,63 @@ impl Server {
             eprintln!("accepted connection from {peer}");
 
             let store = Arc::clone(&self.store);
-            if let Err(e) = thread::Builder::new().spawn(move || {
-                if let Err(e) = handle_connection(stream, &store, peer) {
-                    eprintln!("connection error from {peer}: {e}");
-                }
-            }) {
+            let spawned =
+                thread::Builder::new().spawn(move || match handle_connection(stream, &store) {
+                    Ok(end) => eprintln!("disconnected {peer}: {}", end.reason()),
+                    Err(e) => eprintln!("connection error from {peer}: {e}"),
+                });
+
+            if let Err(e) = spawned {
                 eprintln!("failed to spawn connection thread from {peer}: {e}");
             }
         }
     }
 }
 
-/// Serves RESP2 requests until the peer closes or the framing breaks.
-fn handle_connection(stream: TcpStream, store: &Store, peer: SocketAddr) -> io::Result<()> {
+/// Why a connection thread ended.
+enum Disconnected {
+    /// peer closed at a frame boundary
+    Eof,
+    /// peer sent `QUIT`
+    Quit,
+    /// framing broke; the peer already got the error reply
+    Protocol(String),
+}
+
+impl Disconnected {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Eof => "peer closed the connection",
+            Self::Quit => "quit",
+            Self::Protocol(detail) => detail,
+        }
+    }
+}
+
+/// Serves RESP2 requests until EOF, `QUIT`, a protocol error, or an I/O failure.
+///
+/// - returns the end reason instead of logging; the caller owns stderr
+/// - a silent client holds its thread until it disconnects
+fn handle_connection(stream: TcpStream, store: &Store) -> io::Result<Disconnected> {
     let mut stream = BufReader::new(stream);
     let mut out = Vec::new();
 
     loop {
         out.clear();
-        let (reply, close) = match resp::read_request(&mut stream) {
+        let (reply, end) = match resp::read_request(&mut stream) {
             // `Ok(None)` is EOF at a frame boundary, not an error.
-            Ok(None) => break,
+            Ok(None) => return Ok(Disconnected::Eof),
             Ok(Some(args)) => match command::execute(store, &args) {
                 // `*0` is a request with no command in it: nothing to reply with.
                 None => continue,
-                Some(executed) => (executed.reply, executed.close),
+                Some(executed) => (executed.reply, executed.close.then_some(Disconnected::Quit)),
             },
             Err(RequestError::Protocol(e)) => {
                 // The stream is unparseable: reply, then drop the connection.
-                eprintln!("protocol error from {peer}: {}", e.detail());
+                let detail = e.detail();
                 (
-                    Reply::Error(format!("ERR Protocol error: {}", e.detail())),
-                    true,
+                    Reply::Error(format!("ERR Protocol error: {detail}")),
+                    Some(Disconnected::Protocol(format!("protocol error: {detail}"))),
                 )
             }
             Err(RequestError::Io(e)) => return Err(e),
@@ -105,11 +130,10 @@ fn handle_connection(stream: TcpStream, store: &Store, peer: SocketAddr) -> io::
         resp::encode(&reply, &mut out);
         stream.get_mut().write_all(&out)?;
 
-        if close {
-            break;
+        if let Some(end) = end {
+            return Ok(end);
         }
     }
-    Ok(())
 }
 
 fn is_transient(e: &io::Error) -> bool {
