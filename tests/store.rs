@@ -119,6 +119,22 @@ fn shared_handle_across_threads() {
     }
 }
 
+/// Batch helpers take any iterator of key slices and keep duplicate semantics.
+#[test]
+fn batch_helpers_accept_any_key_iterator() {
+    let store = Store::new();
+    store.set(b"a", b"1");
+    store.set(b"b", b"2");
+
+    let keys: [&[u8]; 3] = [b"a", b"a", b"missing"];
+    assert_eq!(store.exists_many(keys), 2);
+    assert_eq!(store.exists_many(keys.iter().copied()), 2);
+
+    assert_eq!(store.del_many(keys.iter().copied()), 1);
+    assert!(!store.exists(b"a"));
+    assert!(store.exists(b"b"));
+}
+
 /// Concurrent readers see whole snapshots while a writer replaces the value.
 #[test]
 fn readers_never_observe_torn_values() {
