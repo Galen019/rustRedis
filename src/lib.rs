@@ -1,29 +1,38 @@
-//! Blocking, thread-per-connection TCP echo server.
+//! Blocking, thread-per-connection RESP2 server.
 //!
-//! - [`Server`]: socket plumbing
-//! - [`Store`]: in-memory key/value map, not yet on the wire
+//! - [`Server`]: socket plumbing and the connection loop
+//! - `resp`: request framing and reply encoding
+//! - `command`: command dispatch over the [`Store`]
+//! - [`Store`]: in-memory key/value map
 
+mod command;
+mod resp;
 mod store;
 
 pub use store::Store;
 
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::thread;
+
+use crate::resp::{Reply, RequestError};
 
 /// A bound TCP listener that has not started accepting yet.
 pub struct Server {
     listener: TcpListener,
+    store: Arc<Store>,
 }
 
 impl Server {
-    /// Binds `addr` without accepting.
+    /// Binds `addr` without accepting; every connection shares `store`.
     ///
     /// - `"127.0.0.1:0"` asks the kernel for a free port
     /// - read it with [`Server::local_addr`] before [`Server::serve`]
-    pub fn bind(addr: &str) -> io::Result<Self> {
+    pub fn bind(addr: &str, store: Arc<Store>) -> io::Result<Self> {
         Ok(Self {
             listener: TcpListener::bind(addr)?,
+            store,
         })
     }
 
@@ -34,12 +43,12 @@ impl Server {
 
     /// Accepts connections forever.
     ///
-    /// - one detached thread per connection
+    /// - one detached thread per connection, all sharing the store
     /// - a silent client holds its thread until it disconnects
     /// - transient accept errors are retried; others end the loop
     pub fn serve(self) -> io::Result<()> {
         loop {
-            let (mut stream, peer) = match self.listener.accept() {
+            let (stream, peer) = match self.listener.accept() {
                 Ok(accepted) => accepted,
                 Err(e) if is_transient(&e) => {
                     eprintln!("accept failed (transient, continuing): {e}");
@@ -50,13 +59,14 @@ impl Server {
             };
 
             // Best-effort Nagle disable: ~40ms less latency on small round trips.
-            // A failure is not fatal; echo with Nagle on.
+            // A failure is not fatal; serve with Nagle on.
             let _ = stream.set_nodelay(true);
 
             eprintln!("accepted connection from {peer}");
 
+            let store = Arc::clone(&self.store);
             if let Err(e) = thread::Builder::new().spawn(move || {
-                if let Err(e) = handle_connection(&mut stream) {
+                if let Err(e) = handle_connection(stream, &store, peer) {
                     eprintln!("connection error from {peer}: {e}");
                 }
             }) {
@@ -66,16 +76,37 @@ impl Server {
     }
 }
 
-/// Echoes each read back until the peer half-closes.
-fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
-    let mut buf = [0u8; 4096];
+/// Serves RESP2 requests until the peer closes or the framing breaks.
+fn handle_connection(stream: TcpStream, store: &Store, peer: SocketAddr) -> io::Result<()> {
+    let mut stream = BufReader::new(stream);
+    let mut out = Vec::new();
+
     loop {
-        match stream.read(&mut buf) {
-            // `Ok(0)` is EOF, not an error: the peer will send nothing more.
-            Ok(0) => break,
-            Ok(n) => stream.write_all(&buf[..n])?,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+        out.clear();
+        let (reply, close) = match resp::read_request(&mut stream) {
+            // `Ok(None)` is EOF at a frame boundary, not an error.
+            Ok(None) => break,
+            Ok(Some(args)) => match command::execute(store, &args) {
+                // `*0` is a request with no command in it: nothing to reply with.
+                None => continue,
+                Some(executed) => (executed.reply, executed.close),
+            },
+            Err(RequestError::Protocol(e)) => {
+                // The stream is unparseable: reply, then drop the connection.
+                eprintln!("protocol error from {peer}: {}", e.detail());
+                (
+                    Reply::Error(format!("ERR Protocol error: {}", e.detail())),
+                    true,
+                )
+            }
+            Err(RequestError::Io(e)) => return Err(e),
+        };
+
+        resp::encode(&reply, &mut out);
+        stream.get_mut().write_all(&out)?;
+
+        if close {
+            break;
         }
     }
     Ok(())
@@ -84,6 +115,6 @@ fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
 fn is_transient(e: &io::Error) -> bool {
     matches!(
         e.kind(),
-        ErrorKind::ConnectionAborted | ErrorKind::Interrupted
+        io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted
     )
 }

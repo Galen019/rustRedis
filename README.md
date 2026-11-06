@@ -1,12 +1,13 @@
 # rustRedis
 
-A minimal TCP server in Rust, built as a learning foundation for a Redis-like server.
+A minimal RESP2 server in Rust, built as a learning foundation for a Redis-like server.
 
 ## What works now
 
 - Binds `127.0.0.1:6379` and accepts connections forever: blocking `std::net`, one detached thread per connection, no deps, no async runtime.
-- Echoes every byte a client sends back, verbatim, until the client closes its write half.
-- An in-memory key/value store (`src/store.rs`): `get`, `set`, `del`, `exists` over binary-safe `Vec<u8>` keys and `Arc<[u8]>` values, backed by a single `RwLock<HashMap<_, _>>`, shareable across connection threads as `Arc<Store>`. No TTL. **Nothing on the network can call it yet.**
+- Speaks RESP2: requests are arrays of bulk strings; replies are simple strings, bulk strings, integers, and errors. No inline commands, no RESP3.
+- Commands: `GET`, `SET`, `DEL`, `EXISTS`, `PING`, `QUIT`. `SET` takes exactly a key and a value: no `EX`/`PX`/`NX`/`XX`, so a fourth argument is a syntax error.
+- An in-memory key/value store (`src/store.rs`): `get`, `set`, `del`, `del_many`, `exists`, `exists_many` over binary-safe `Vec<u8>` keys and `Arc<[u8]>` values, backed by a single `RwLock<HashMap<_, _>>`, shared across connection threads as `Arc<Store>`. No TTL.
 
 ## Run it
 
@@ -14,15 +15,25 @@ A minimal TCP server in Rust, built as a learning foundation for a Redis-like se
 cargo run
 ```
 
-Then in another shell, run the raw-socket smoke test (a `System.Net.Sockets.TcpClient` that sends a string and checks it comes back unchanged):
+Then in another shell:
 
 ```
-./scripts/echo.ps1
+redis-cli SET greeting hello
+redis-cli GET greeting
+redis-cli DEL greeting
+```
+
+`redis-cli` works, but its startup `COMMAND DOCS` hint request is answered with an unknown-command error, so tab completion stays empty.
+
+Or run the raw-socket smoke test (a `System.Net.Sockets.TcpClient` that sends RESP2 bytes and checks each reply byte for byte):
+
+```
+./scripts/resp.ps1
 ```
 
 ## Not yet
 
-- RESP parsing and real command semantics. The store from the previous milestone exists but is unreachable from a client: that gap is exactly what RESP parsing plus a command layer closes, which is why they are the next milestone rather than a later one.
-- `redis-cli` interop: **not yet, next milestone.** It fails today because the server faithfully echoes `redis-cli`'s request instead of parsing it. That failure is expected, not a bug.
+- TTL/expiry, persistence, and value types beyond opaque bytes (lists, hashes, sets).
+- `SET` options, `MULTI`/transactions, keyspace notifications, pub/sub, clustering.
+- RESP3 (`HELLO`), inline commands, and the `COMMAND` introspection commands.
 - Graceful shutdown (Ctrl-C severs in-flight connections), per-client timeouts, and anything beyond thread-per-connection (silent clients each pin a thread).
-- Persistence, expiry, value types, pub/sub, clustering: the fun stuff.

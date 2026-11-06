@@ -33,12 +33,34 @@ impl Store {
 
     /// Removes `key`, returning whether it was present.
     pub fn del(&self, key: &[u8]) -> bool {
-        self.write().remove(key).is_some()
+        self.del_many([key]) == 1
+    }
+
+    /// Removes `keys`, returning how many were present.
+    ///
+    /// - one write lock for the whole batch, so no other thread sees it half-applied
+    /// - duplicate keys count once: the second removal finds nothing
+    pub fn del_many<'a>(&self, keys: impl IntoIterator<Item = &'a [u8]>) -> usize {
+        let mut map = self.write();
+        keys.into_iter()
+            .filter(|&key| map.remove(key).is_some())
+            .count()
     }
 
     /// Returns whether `key` is present.
     pub fn exists(&self, key: &[u8]) -> bool {
-        self.read().contains_key(key)
+        self.exists_many([key]) == 1
+    }
+
+    /// Counts how many of `keys` are present.
+    ///
+    /// - one read lock for the whole batch: the count is a snapshot
+    /// - duplicate keys count once per occurrence
+    pub fn exists_many<'a>(&self, keys: impl IntoIterator<Item = &'a [u8]>) -> usize {
+        let map = self.read();
+        keys.into_iter()
+            .filter(|&key| map.contains_key(key))
+            .count()
     }
 
     // A panic while the lock is held poisons it: another thread may have died
