@@ -29,7 +29,7 @@ Learning project: a Redis-like server built in deliberate milestones. Read this 
 - `src/store.rs` — `Store`: `RwLock<HashMap<Vec<u8>, Arc<[u8]>>>`. Binary-safe keys/values, empty key and empty value are valid. `get` returns an owned `Arc<[u8]>` snapshot; `del_many`/`exists_many` accept any iterator of key slices and hold one guard each, so a batch is a snapshot. `Store` is not `Clone` (share an `Arc<Store>`). A poisoned lock panics deliberately.
 - `src/main.rs` — binary entrypoint; binds `127.0.0.1:6379` with a fresh store and reads `REDIS_MAX_CONNECTIONS`.
 - `tests/resp.rs`, `tests/store.rs` — integration tests. Unit tests for the parser, dispatcher, connection limiter, and env cap parser live in `src/resp.rs`, `src/command.rs`, `src/lib.rs`, and `src/main.rs`.
-- `scripts/resp.ps1` — manual smoke test (PowerShell/Windows); no bash equivalent.
+- `examples/smoke.rs` — manual smoke test over a socket; expects a running server and defaults to `127.0.0.1:6379`.
 
 ## Commands
 
@@ -40,10 +40,10 @@ cargo test --test resp                      # one suite
 cargo test crud_lifecycle                   # one test by name
 cargo clippy --all-targets -- -D warnings   # currently clean; keep it that way
 cargo fmt
-./scripts/resp.ps1                          # run while cargo run is active
+cargo run --example smoke                   # with the server running
 ```
 
-No CI, rustfmt, or clippy config exists, so tool defaults apply. Before finishing, run `cargo test` and clippy.
+No rustfmt or clippy config exists, so tool defaults apply. `.github/workflows/ci.yml` runs `cargo test`, the smoke example, and clippy on pull requests. Before finishing, run `cargo test` and clippy.
 
 ## Testing quirks
 
@@ -52,7 +52,7 @@ No CI, rustfmt, or clippy config exists, so tool defaults apply. Before finishin
 - Replies are asserted as **exact bytes** (`expect_reply`), not decoded: the byte literals are the contract. `tests/resp.rs` also builds requests with the `command` helper.
 - Pass the same `Arc<Store>` into `start_server` and into the test when a case needs to check store state directly; that proves the wire reached the shared map.
 - Cover framing by writing raw bytes: pipelining, a request split across writes, `*0`, bare line feeds, and protocol errors. Parser caps belong in the unit tests in `src/resp.rs`, not over a socket.
-- Tests never need a running server; only `scripts/resp.ps1` does. Never point tests at port 6379.
+- Tests never need a running server; only `examples/smoke.rs` does. Never point tests at port 6379.
 - Store tests assert binary safety and that empty keys/values are distinct from absence. Keep those semantics when extending the store.
 
 ## Style Guide
