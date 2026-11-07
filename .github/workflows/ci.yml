@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test & lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test
+
+      - name: smoke test
+        run: |
+          cargo build
+          ./target/debug/rust_redis > /tmp/rust_redis-smoke.log 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 100); do
+            if grep -q 'listening on' /tmp/rust_redis-smoke.log; then
+              break
+            fi
+            if ! kill -0 "$server" 2>/dev/null; then
+              cat /tmp/rust_redis-smoke.log >&2
+              exit 1
+            fi
+            sleep 0.1
+          done
+
+          grep -q 'listening on' /tmp/rust_redis-smoke.log || {
+            cat /tmp/rust_redis-smoke.log >&2
+            exit 1
+          }
+
+          cargo run --example smoke -- 127.0.0.1:6379
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings

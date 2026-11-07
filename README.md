@@ -27,11 +27,13 @@ redis-cli DEL greeting
 
 `redis-cli` works, but its startup `COMMAND DOCS` hint request is answered with an unknown-command error, so tab completion stays empty.
 
-Or run the raw-socket smoke test (a `System.Net.Sockets.TcpClient` that sends RESP2 bytes and checks each reply byte for byte):
+Or, with the server running in another shell, run the raw-socket smoke test (sends RESP2 bytes and checks each reply):
 
 ```
-./scripts/resp.ps1
+cargo run --example smoke
 ```
+
+It targets `127.0.0.1:6379` by default; pass another address with `cargo run --example smoke -- ADDR`.
 
 ## Not yet
 
