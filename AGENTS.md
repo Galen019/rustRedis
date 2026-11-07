@@ -8,6 +8,7 @@ Learning project: a Redis-like server built in deliberate milestones. Read this 
 - Command surface is deliberately small: `GET`, `SET`, `DEL`, `EXISTS`, `PING`, `QUIT`. `SET` accepts exactly two arguments; any fourth argument is `ERR syntax error`. No expiry, no conditional set, no value types.
 - Requests must be arrays of bulk strings. Inline commands are a protocol error. `*0` is ignored with no reply. Unknown commands reply with an error and keep the connection open; protocol errors reply and close.
 - `redis-cli` interop works for the commands above. Its `COMMAND DOCS` hint request is answered with an unknown-command error, so tab completion is empty.
+- Idle timeouts exist but stay off unless `Server::idle_timeout` is given a non-zero duration; each socket is armed with read and write timeouts, and the binary never sets one.
 - README's "Not yet" list is the intended scope: no TTL, persistence, value types, graceful shutdown, RESP3, or async runtime.
 
 ## Constraints
@@ -21,7 +22,7 @@ Learning project: a Redis-like server built in deliberate milestones. Read this 
 
 ## Layout
 
-- `src/lib.rs` — `Server { listener, store }`: `bind`, `local_addr`, `serve`. Thread-per-connection, TCP_NODELAY best-effort, transient accept errors retried. The connection loop is `read_request` → `execute` → `encode` into a reused buffer → one `write_all` per request; `Executed::close` and clean EOF end it with a `Disconnected` reason, which `serve` logs as exactly one line per connection end.
+- `src/lib.rs` — `Server { listener, store, idle_timeout }`: `bind`, `idle_timeout`, `local_addr`, `serve`. Thread-per-connection, TCP_NODELAY best-effort, transient accept errors retried. The connection loop is `read_request` → `execute` → `encode` into a reused buffer → one `write_all` per request; `Executed::close`, clean EOF, and a socket timeout each end it with a `Disconnected` reason, which `serve` logs as exactly one line per connection end.
 - `src/resp.rs` — `Reply` and `encode`; `read_request` over any `BufRead`; `ProtocolError`/`RequestError`; the three caps. Header reads are capped with `Read::take` because `read_until` grows without bound; bulk payloads grow with received bytes; error text escapes peer bytes.
 - `src/command.rs` — `execute(&Store, &[Vec<u8>]) -> Option<Executed>`; `Executed { reply, close }` pairs a frame with whether the connection closes. Socket-free: name matching (ASCII case-insensitive), arity checks, store access. `None` means "no reply" (`*0`).
 - `src/store.rs` — `Store`: `RwLock<HashMap<Vec<u8>, Arc<[u8]>>>`. Binary-safe keys/values, empty key and empty value are valid. `get` returns an owned `Arc<[u8]>` snapshot; `del_many`/`exists_many` accept any iterator of key slices and hold one guard each, so a batch is a snapshot. `Store` is not `Clone` (share an `Arc<Store>`). A poisoned lock panics deliberately.
@@ -46,6 +47,7 @@ No CI, rustfmt, or clippy config exists, so tool defaults apply. Before finishin
 ## Testing quirks
 
 - Network tests bind port `0`, read `local_addr()` before connecting, and serve from a detached thread. There are no sleeps or retries; preserve that pattern so tests stay fast and non-flaky.
+- Idle-timeout tests are the one exception: they use a 100–200ms timeout and at most four 100ms sleeps, bounded so a regression fails instead of hanging. Async waits stay on blocking reads.
 - Replies are asserted as **exact bytes** (`expect_reply`), not decoded: the byte literals are the contract. `tests/resp.rs` also builds requests with the `command` helper.
 - Pass the same `Arc<Store>` into `start_server` and into the test when a case needs to check store state directly; that proves the wire reached the shared map.
 - Cover framing by writing raw bytes: pipelining, a request split across writes, `*0`, bare line feeds, and protocol errors. Parser caps belong in the unit tests in `src/resp.rs`, not over a socket.

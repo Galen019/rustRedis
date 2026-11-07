@@ -8,6 +8,7 @@ A minimal RESP2 server in Rust, built as a learning foundation for a Redis-like 
 - Speaks RESP2: requests are arrays of bulk strings; replies are simple strings, bulk strings, integers, and errors. No inline commands, no RESP3.
 - Commands: `GET`, `SET`, `DEL`, `EXISTS`, `PING`, `QUIT`. `SET` takes exactly a key and a value: no `EX`/`PX`/`NX`/`XX`, so a fourth argument is a syntax error.
 - An in-memory key/value store (`src/store.rs`): `get`, `set`, `del`, `del_many`, `exists`, `exists_many` over binary-safe `Vec<u8>` keys and `Arc<[u8]>` values, backed by a single `RwLock<HashMap<_, _>>`, shared across connection threads as `Arc<Store>`. No TTL.
+- Optional idle timeout (`src/lib.rs`): `Server::idle_timeout(Some(duration))` arms read and write timeouts, so a connection that stalls mid-request or stops draining replies is closed. `None` or a zero duration leaves sockets blocking, and the binary leaves it disabled.
 
 ## Run it
 
@@ -36,4 +37,4 @@ Or run the raw-socket smoke test (a `System.Net.Sockets.TcpClient` that sends RE
 - TTL/expiry, persistence, and value types beyond opaque bytes (lists, hashes, sets).
 - `SET` options, `MULTI`/transactions, keyspace notifications, pub/sub, clustering.
 - RESP3 (`HELLO`), inline commands, and the `COMMAND` introspection commands.
-- Graceful shutdown (Ctrl-C severs in-flight connections), per-client timeouts, and anything beyond thread-per-connection (silent clients each pin a thread).
+- Graceful shutdown (Ctrl-C severs in-flight connections), and anything beyond thread-per-connection (silent clients each pin a thread unless an idle timeout is set).

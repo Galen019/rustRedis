@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::thread;
@@ -9,11 +9,18 @@ use rust_redis::{Server, Store};
 /// Generous, but finite: a regression must fail, not hang `cargo test`.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Binds port 0 and serves from a detached thread over `store`.
+/// Binds port 0 and serves from a detached thread over `store`, no idle timeout.
 ///
 /// - the listener is live before return, so no sleep or retry is needed
 fn start_server(store: Arc<Store>) -> SocketAddr {
-    let server = Server::bind("127.0.0.1:0", store).expect("bind");
+    start_server_with_timeout(store, None)
+}
+
+/// Like [`start_server`] but with an idle timeout in effect.
+fn start_server_with_timeout(store: Arc<Store>, idle_timeout: Option<Duration>) -> SocketAddr {
+    let server = Server::bind("127.0.0.1:0", store)
+        .expect("bind")
+        .idle_timeout(idle_timeout);
     let addr = server.local_addr().expect("local_addr");
 
     // Detached on purpose: this thread is never joined and dies with the test
@@ -316,4 +323,72 @@ fn client_half_close_ends_the_connection() {
 
     client.shutdown(Shutdown::Write).expect("shutdown write");
     expect_eof(&mut client);
+}
+
+/// Idle connections are closed, and the listener keeps serving after.
+#[test]
+fn idle_connection_is_closed() {
+    let addr = start_server_with_timeout(Arc::new(Store::new()), Some(Duration::from_millis(100)));
+
+    let mut first = connect(addr);
+    let mut second = connect(addr);
+    expect_eof(&mut first);
+    expect_eof(&mut second);
+
+    let mut fresh = connect(addr);
+    send(&mut fresh, &command(&[b"PING"]));
+    expect_reply(&mut fresh, b"+PONG\r\n");
+}
+
+/// Traffic re-arms the socket timeout, so it postpones the close.
+#[test]
+fn traffic_postpones_the_timeout() {
+    let addr = start_server_with_timeout(Arc::new(Store::new()), Some(Duration::from_millis(200)));
+    let mut client = connect(addr);
+
+    // Each gap is half the timeout and the total outlives it, so a connection
+    // closed on total age would die before the later `+PONG`.
+    for _ in 0..4 {
+        thread::sleep(Duration::from_millis(100));
+        send(&mut client, &command(&[b"PING"]));
+        expect_reply(&mut client, b"+PONG\r\n");
+    }
+}
+
+/// Traffic does not make a connection immortal.
+#[test]
+fn idle_after_traffic_is_closed() {
+    let addr = start_server_with_timeout(Arc::new(Store::new()), Some(Duration::from_millis(100)));
+    let mut client = connect(addr);
+
+    send(&mut client, &command(&[b"PING"]));
+    expect_reply(&mut client, b"+PONG\r\n");
+    expect_eof(&mut client);
+}
+
+/// `None` and `Duration::ZERO` both mean "never time out".
+#[test]
+fn disabled_timeout_keeps_connections_open() {
+    for idle_timeout in [None, Some(Duration::ZERO)] {
+        let addr = start_server_with_timeout(Arc::new(Store::new()), idle_timeout);
+        let mut client = connect(addr);
+        client
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("set read timeout");
+
+        // Nothing arrives and nothing closes, so only the client-side timeout
+        // can end this read.
+        let mut byte = [0u8; 1];
+        let err = client
+            .read(&mut byte)
+            .expect_err("server closed an idle connection");
+        assert!(
+            matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+            "unexpected error kind: {err:?}"
+        );
+
+        // The connection is still usable afterwards.
+        send(&mut client, &command(&[b"PING"]));
+        expect_reply(&mut client, b"+PONG\r\n");
+    }
 }

@@ -15,6 +15,7 @@ use std::io::{self, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use crate::resp::{Reply, RequestError};
 
@@ -22,6 +23,7 @@ use crate::resp::{Reply, RequestError};
 pub struct Server {
     listener: TcpListener,
     store: Arc<Store>,
+    idle_timeout: Option<Duration>,
 }
 
 impl Server {
@@ -33,7 +35,18 @@ impl Server {
         Ok(Self {
             listener: TcpListener::bind(addr)?,
             store,
+            idle_timeout: None,
         })
+    }
+
+    /// Closes connections that stall for `timeout`.
+    ///
+    /// - `None` or a zero duration leaves sockets blocking with no deadline
+    /// - armed as read and write timeouts, so a client that stops mid-request
+    ///   is closed too
+    pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.idle_timeout = timeout.filter(|timeout| !timeout.is_zero());
+        self
     }
 
     /// The address the socket actually bound to.
@@ -44,6 +57,7 @@ impl Server {
     /// Accepts connections forever.
     ///
     /// - one detached thread per connection, all sharing the store
+    /// - with an idle timeout, each socket is armed so a stalled peer ends it
     /// - each connection end is logged once with its reason
     /// - transient accept errors are retried; others end the loop
     pub fn serve(self) -> io::Result<()> {
@@ -61,6 +75,13 @@ impl Server {
             // Best-effort Nagle disable: ~40ms less latency on small round trips.
             // A failure is not fatal; serve with Nagle on.
             let _ = stream.set_nodelay(true);
+
+            if let Some(timeout) = self.idle_timeout {
+                // Silently losing the timeout would leave the connection unwatched.
+                if let Err(e) = arm_timeouts(&stream, timeout) {
+                    eprintln!("failed to set idle timeout for {peer}: {e}");
+                }
+            }
 
             eprintln!("accepted connection from {peer}");
 
@@ -84,6 +105,8 @@ enum Disconnected {
     Eof,
     /// peer sent `QUIT`
     Quit,
+    /// the peer sent or drained nothing before the socket timeout
+    Timeout,
     /// framing broke; the peer already got the error reply
     Protocol(String),
 }
@@ -93,15 +116,17 @@ impl Disconnected {
         match self {
             Self::Eof => "peer closed the connection",
             Self::Quit => "quit",
+            Self::Timeout => "idle timeout",
             Self::Protocol(detail) => detail,
         }
     }
 }
 
-/// Serves RESP2 requests until EOF, `QUIT`, a protocol error, or an I/O failure.
+/// Serves RESP2 requests until EOF, `QUIT`, a protocol error, an idle timeout,
+/// or another I/O failure.
 ///
 /// - returns the end reason instead of logging; the caller owns stderr
-/// - a silent client holds its thread until it disconnects
+/// - a timed-out read or write is a normal end, not an error
 fn handle_connection(stream: TcpStream, store: &Store) -> io::Result<Disconnected> {
     let mut stream = BufReader::new(stream);
     let mut out = Vec::new();
@@ -124,16 +149,37 @@ fn handle_connection(stream: TcpStream, store: &Store) -> io::Result<Disconnecte
                     Some(Disconnected::Protocol(format!("protocol error: {detail}"))),
                 )
             }
+            Err(RequestError::Io(e)) if is_timeout(&e) => return Ok(Disconnected::Timeout),
             Err(RequestError::Io(e)) => return Err(e),
         };
 
         resp::encode(&reply, &mut out);
-        stream.get_mut().write_all(&out)?;
+        if let Err(e) = stream.get_mut().write_all(&out) {
+            return if is_timeout(&e) {
+                Ok(Disconnected::Timeout)
+            } else {
+                Err(e)
+            };
+        }
 
         if let Some(end) = end {
             return Ok(end);
         }
     }
+}
+
+/// Arms the idle deadline on both directions.
+fn arm_timeouts(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))
+}
+
+/// A socket timeout: the peer sent or drained nothing within the deadline.
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 fn is_transient(e: &io::Error) -> bool {
