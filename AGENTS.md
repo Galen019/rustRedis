@@ -9,6 +9,7 @@ Learning project: a Redis-like server built in deliberate milestones. Read this 
 - Requests must be arrays of bulk strings. Inline commands are a protocol error. `*0` is ignored with no reply. Unknown commands reply with an error and keep the connection open; protocol errors reply and close.
 - `redis-cli` interop works for the commands above. Its `COMMAND DOCS` hint request is answered with an unknown-command error, so tab completion is empty.
 - Idle timeouts exist but stay off unless `Server::idle_timeout` is given a non-zero duration; each socket is armed with read and write timeouts, and the binary never sets one.
+- `Server::max_connections` caps live connections; `None` (the default) or `Some(0)` means unlimited and the binary sets `Some(10_000)`. `REDIS_MAX_CONNECTIONS` overrides the binary's cap (`0` = unlimited); an unparsable value aborts startup. A peer over the cap is sent `-ERR max number of clients reached` and closed without a thread.
 - README's "Not yet" list is the intended scope: no TTL, persistence, value types, graceful shutdown, RESP3, or async runtime.
 
 ## Constraints
@@ -22,12 +23,12 @@ Learning project: a Redis-like server built in deliberate milestones. Read this 
 
 ## Layout
 
-- `src/lib.rs` — `Server { listener, store, idle_timeout }`: `bind`, `idle_timeout`, `local_addr`, `serve`. Thread-per-connection, TCP_NODELAY best-effort, transient accept errors retried. The connection loop is `read_request` → `execute` → `encode` into a reused buffer → one `write_all` per request; `Executed::close`, clean EOF, and a socket timeout each end it with a `Disconnected` reason, which `serve` logs as exactly one line per connection end.
+- `src/lib.rs` — `Server { listener, store, idle_timeout, max_connections }`: `bind`, `idle_timeout`, `max_connections`, `local_addr`, `serve`. Thread-per-connection, TCP_NODELAY best-effort, transient accept errors retried. A private `Connections` counter and `ConnectionPermit` guard release a slot on drop, covering rejection, spawn failure, and panics. The connection loop is `read_request` → `execute` → `encode` into a reused buffer → one `write_all` per request; `Executed::close`, clean EOF, and a socket timeout each end it with a `Disconnected` reason, which `serve` logs as exactly one line per connection end.
 - `src/resp.rs` — `Reply` and `encode`; `read_request` over any `BufRead`; `ProtocolError`/`RequestError`; the three caps. Header reads are capped with `Read::take` because `read_until` grows without bound; bulk payloads grow with received bytes; error text escapes peer bytes.
 - `src/command.rs` — `execute(&Store, &[Vec<u8>]) -> Option<Executed>`; `Executed { reply, close }` pairs a frame with whether the connection closes. Socket-free: name matching (ASCII case-insensitive), arity checks, store access. `None` means "no reply" (`*0`).
 - `src/store.rs` — `Store`: `RwLock<HashMap<Vec<u8>, Arc<[u8]>>>`. Binary-safe keys/values, empty key and empty value are valid. `get` returns an owned `Arc<[u8]>` snapshot; `del_many`/`exists_many` accept any iterator of key slices and hold one guard each, so a batch is a snapshot. `Store` is not `Clone` (share an `Arc<Store>`). A poisoned lock panics deliberately.
-- `src/main.rs` — binary entrypoint; binds `127.0.0.1:6379` with a fresh store.
-- `tests/resp.rs`, `tests/store.rs` — integration tests. Unit tests for the parser and the dispatcher live in `src/resp.rs` and `src/command.rs`.
+- `src/main.rs` — binary entrypoint; binds `127.0.0.1:6379` with a fresh store and reads `REDIS_MAX_CONNECTIONS`.
+- `tests/resp.rs`, `tests/store.rs` — integration tests. Unit tests for the parser, dispatcher, connection limiter, and env cap parser live in `src/resp.rs`, `src/command.rs`, `src/lib.rs`, and `src/main.rs`.
 - `scripts/resp.ps1` — manual smoke test (PowerShell/Windows); no bash equivalent.
 
 ## Commands

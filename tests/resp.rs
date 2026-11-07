@@ -9,18 +9,16 @@ use rust_redis::{Server, Store};
 /// Generous, but finite: a regression must fail, not hang `cargo test`.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Binds port 0 and serves from a detached thread over `store`, no idle timeout.
+/// Binds port 0 and serves from a detached thread over `store`.
 ///
 /// - the listener is live before return, so no sleep or retry is needed
 fn start_server(store: Arc<Store>) -> SocketAddr {
-    start_server_with_timeout(store, None)
+    start_server_with(store, |server| server)
 }
 
-/// Like [`start_server`] but with an idle timeout in effect.
-fn start_server_with_timeout(store: Arc<Store>, idle_timeout: Option<Duration>) -> SocketAddr {
-    let server = Server::bind("127.0.0.1:0", store)
-        .expect("bind")
-        .idle_timeout(idle_timeout);
+/// Binds port 0 and serves from a detached thread with `configure` applied.
+fn start_server_with(store: Arc<Store>, configure: impl FnOnce(Server) -> Server) -> SocketAddr {
+    let server = configure(Server::bind("127.0.0.1:0", store).expect("bind"));
     let addr = server.local_addr().expect("local_addr");
 
     // Detached on purpose: this thread is never joined and dies with the test
@@ -328,7 +326,9 @@ fn client_half_close_ends_the_connection() {
 /// Idle connections are closed, and the listener keeps serving after.
 #[test]
 fn idle_connection_is_closed() {
-    let addr = start_server_with_timeout(Arc::new(Store::new()), Some(Duration::from_millis(100)));
+    let addr = start_server_with(Arc::new(Store::new()), |server| {
+        server.idle_timeout(Some(Duration::from_millis(100)))
+    });
 
     let mut first = connect(addr);
     let mut second = connect(addr);
@@ -343,7 +343,9 @@ fn idle_connection_is_closed() {
 /// Traffic re-arms the socket timeout, so it postpones the close.
 #[test]
 fn traffic_postpones_the_timeout() {
-    let addr = start_server_with_timeout(Arc::new(Store::new()), Some(Duration::from_millis(200)));
+    let addr = start_server_with(Arc::new(Store::new()), |server| {
+        server.idle_timeout(Some(Duration::from_millis(200)))
+    });
     let mut client = connect(addr);
 
     // Each gap is half the timeout and the total outlives it, so a connection
@@ -358,7 +360,9 @@ fn traffic_postpones_the_timeout() {
 /// Traffic does not make a connection immortal.
 #[test]
 fn idle_after_traffic_is_closed() {
-    let addr = start_server_with_timeout(Arc::new(Store::new()), Some(Duration::from_millis(100)));
+    let addr = start_server_with(Arc::new(Store::new()), |server| {
+        server.idle_timeout(Some(Duration::from_millis(100)))
+    });
     let mut client = connect(addr);
 
     send(&mut client, &command(&[b"PING"]));
@@ -370,7 +374,9 @@ fn idle_after_traffic_is_closed() {
 #[test]
 fn disabled_timeout_keeps_connections_open() {
     for idle_timeout in [None, Some(Duration::ZERO)] {
-        let addr = start_server_with_timeout(Arc::new(Store::new()), idle_timeout);
+        let addr = start_server_with(Arc::new(Store::new()), |server| {
+            server.idle_timeout(idle_timeout)
+        });
         let mut client = connect(addr);
         client
             .set_read_timeout(Some(Duration::from_millis(300)))
@@ -391,4 +397,40 @@ fn disabled_timeout_keeps_connections_open() {
         send(&mut client, &command(&[b"PING"]));
         expect_reply(&mut client, b"+PONG\r\n");
     }
+}
+
+/// The frame a peer over the cap receives before the close.
+const LIMIT_ERROR: &[u8] = b"-ERR max number of clients reached\r\n";
+
+#[test]
+fn connection_limit_rejects_extra_clients() {
+    let addr = start_server_with(Arc::new(Store::new()), |server| {
+        server.max_connections(Some(1))
+    });
+    let mut holder = connect(addr);
+
+    // The slot is taken before the thread spawns, so a live holder proves the
+    // only one is occupied.
+    send(&mut holder, &command(&[b"PING"]));
+    expect_reply(&mut holder, b"+PONG\r\n");
+
+    let mut rejected = connect(addr);
+    expect_reply(&mut rejected, LIMIT_ERROR);
+    expect_eof(&mut rejected);
+
+    // Rejecting the extra peer left the holder untouched.
+    send(&mut holder, &command(&[b"PING"]));
+    expect_reply(&mut holder, b"+PONG\r\n");
+}
+
+#[test]
+fn default_max_connections_is_unlimited() {
+    let addr = start_server(Arc::new(Store::new()));
+    let mut first = connect(addr);
+    let mut second = connect(addr);
+
+    send(&mut first, &command(&[b"PING"]));
+    expect_reply(&mut first, b"+PONG\r\n");
+    send(&mut second, &command(&[b"PING"]));
+    expect_reply(&mut second, b"+PONG\r\n");
 }
