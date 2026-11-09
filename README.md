@@ -1,6 +1,6 @@
 # rustRedis
 
-A minimal RESP2 server in Rust, built as a learning foundation for a Redis-like server.
+A minimal RESP2 Redis-like server in Rust.
 
 ## What works now
 
