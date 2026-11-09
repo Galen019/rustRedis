@@ -2,7 +2,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rust_redis::{Server, Store};
 
@@ -176,7 +176,7 @@ fn clients_share_one_store() {
 
     // The very store the threads use is visible to the test.
     assert_eq!(
-        store.get(b"shared").as_deref(),
+        store.get(b"shared", Instant::now()).as_deref(),
         Some(b"across clients".as_slice())
     );
 }
@@ -259,12 +259,70 @@ fn arity_and_syntax_errors() {
         b"-ERR wrong number of arguments for 'get' command\r\n",
     );
 
-    send(&mut client, &command(&[b"SET", b"k", b"v", b"EX", b"10"]));
+    send(&mut client, &command(&[b"SET", b"k", b"v", b"EX", b"0"]));
+    expect_reply(
+        &mut client,
+        b"-ERR invalid expire time in 'set' command\r\n",
+    );
+
+    send(&mut client, &command(&[b"SET", b"k", b"v", b"EX", b"nope"]));
+    expect_reply(
+        &mut client,
+        b"-ERR value is not an integer or out of range\r\n",
+    );
+
+    send(&mut client, &command(&[b"SET", b"k", b"v", b"EX"]));
     expect_reply(&mut client, b"-ERR syntax error\r\n");
 
-    // The rejected `SET` stored nothing.
+    // No rejected `SET` stored anything.
     send(&mut client, &command(&[b"GET", b"k"]));
     expect_reply(&mut client, b"$-1\r\n");
+}
+
+#[test]
+fn ttl_commands_report_expiry_states() {
+    let addr = start_server(Arc::new(Store::new()));
+    let mut client = connect(addr);
+
+    send(&mut client, &command(&[b"TTL", b"missing"]));
+    expect_reply(&mut client, b":-2\r\n");
+    send(&mut client, &command(&[b"PTTL", b"missing"]));
+    expect_reply(&mut client, b":-2\r\n");
+
+    send(&mut client, &command(&[b"SET", b"k", b"v"]));
+    expect_reply(&mut client, b"+OK\r\n");
+    send(&mut client, &command(&[b"TTL", b"k"]));
+    expect_reply(&mut client, b":-1\r\n");
+    send(&mut client, &command(&[b"PTTL", b"k"]));
+    expect_reply(&mut client, b":-1\r\n");
+
+    // A plain `SET` clears an existing deadline.
+    send(
+        &mut client,
+        &command(&[b"SET", b"k", b"v", b"PX", b"100000"]),
+    );
+    expect_reply(&mut client, b"+OK\r\n");
+    send(&mut client, &command(&[b"SET", b"k", b"v2"]));
+    expect_reply(&mut client, b"+OK\r\n");
+    send(&mut client, &command(&[b"TTL", b"k"]));
+    expect_reply(&mut client, b":-1\r\n");
+
+    // `DEL` removes the key and its deadline together.
+    send(&mut client, &command(&[b"DEL", b"k"]));
+    expect_reply(&mut client, b":1\r\n");
+    send(&mut client, &command(&[b"TTL", b"k"]));
+    expect_reply(&mut client, b":-2\r\n");
+
+    // An active deadline does not survive `DEL` either.
+    send(
+        &mut client,
+        &command(&[b"SET", b"k", b"v", b"PX", b"60000"]),
+    );
+    expect_reply(&mut client, b"+OK\r\n");
+    send(&mut client, &command(&[b"DEL", b"k"]));
+    expect_reply(&mut client, b":1\r\n");
+    send(&mut client, &command(&[b"TTL", b"k"]));
+    expect_reply(&mut client, b":-2\r\n");
 }
 
 #[test]

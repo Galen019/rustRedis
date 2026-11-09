@@ -10,6 +10,7 @@ use std::fmt::Debug;
 use std::io;
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::thread;
 use std::time::Duration;
 
 use redis::{Client, Cmd, Connection, FromRedisValue};
@@ -70,6 +71,68 @@ fn run() -> Result<(), Box<dyn Error>> {
         "GET after DEL",
     )?;
 
+    // Expiry: TTL commands report the deadline, and a short one really elapses.
+    round_trip(
+        &mut conn,
+        redis::cmd("TTL").arg(KEY),
+        -2i64,
+        "TTL after DEL",
+    )?;
+    round_trip(
+        &mut conn,
+        redis::cmd("SET").arg(KEY).arg(VALUE).arg("EX").arg(60),
+        "OK".to_owned(),
+        "SET with EX",
+    )?;
+    expect_ttl_rounds(&mut conn, 60)?;
+    expect_pttl(&mut conn)?;
+
+    round_trip(
+        &mut conn,
+        redis::cmd("SET").arg(KEY).arg(VALUE).arg("PX").arg(50),
+        "OK".to_owned(),
+        "SET with short PX",
+    )?;
+    thread::sleep(Duration::from_millis(200));
+    round_trip(
+        &mut conn,
+        redis::cmd("GET").arg(KEY),
+        None::<String>,
+        "GET after expiry",
+    )?;
+    round_trip(
+        &mut conn,
+        redis::cmd("TTL").arg(KEY),
+        -2i64,
+        "TTL after expiry",
+    )?;
+    round_trip(
+        &mut conn,
+        redis::cmd("DEL").arg(KEY),
+        0i64,
+        "DEL after expiry",
+    )?;
+
+    Ok(())
+}
+
+/// Checks `TTL` reports a fresh 60-second deadline within rounding.
+fn expect_ttl_rounds(conn: &mut Connection, expected: i64) -> Result<(), Box<dyn Error>> {
+    let ttl: i64 = redis::cmd("TTL").arg(KEY).query(conn)?;
+    if !(expected - 1..=expected).contains(&ttl) {
+        return Err(invalid(format!("TTL: expected {expected}, got {ttl}")).into());
+    }
+    println!("OK: TTL -> {ttl}");
+    Ok(())
+}
+
+/// Checks `PTTL` reports roughly the same deadline in milliseconds.
+fn expect_pttl(conn: &mut Connection) -> Result<(), Box<dyn Error>> {
+    let pttl: i64 = redis::cmd("PTTL").arg(KEY).query(conn)?;
+    if !(58_000..=60_000).contains(&pttl) {
+        return Err(invalid(format!("PTTL: expected 58000-60000, got {pttl}")).into());
+    }
+    println!("OK: PTTL -> {pttl}");
     Ok(())
 }
 

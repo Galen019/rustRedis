@@ -3,25 +3,28 @@
 //! - [`Server`]: socket plumbing and the connection loop
 //! - `resp`: request framing and reply encoding
 //! - `command`: command dispatch over the [`Store`]
-//! - [`Store`]: in-memory key/value map
+//! - [`Store`]: in-memory key/value map with optional deadlines
 
 mod command;
 mod resp;
 mod store;
 
-pub use store::Store;
+pub use store::{Store, Ttl};
 
 use std::io::{self, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::resp::{Reply, RequestError};
 
 /// Frame sent to a peer over the connection cap.
 const MAX_CLIENTS_ERROR: &[u8] = b"-ERR max number of clients reached\r\n";
+
+/// How often the background sweeper reclaims expired keys.
+const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A bound TCP listener that has not started accepting yet.
 pub struct Server {
@@ -73,11 +76,23 @@ impl Server {
     /// Accepts connections forever.
     ///
     /// - one detached thread per connection, all sharing the store
+    /// - a sweeper tied to this call reclaims expired keys every [`SWEEP_INTERVAL`]
     /// - connections over the cap are rejected without a thread
     /// - with an idle timeout, each socket is armed so a stalled peer ends it
     /// - each connection end is logged once with its reason
     /// - transient accept errors are retried; others end the loop
     pub fn serve(self) -> io::Result<()> {
+        let (sweeper, stop) = self.spawn_sweeper();
+        let result = self.accept_loop();
+        drop(stop);
+        if let Some(sweeper) = sweeper {
+            let _ = sweeper.join();
+        }
+        result
+    }
+
+    /// Accepts connections until a non-transient accept error.
+    fn accept_loop(&self) -> io::Result<()> {
         let connections = Arc::new(Connections::new(self.max_connections));
         loop {
             let (stream, peer) = match self.listener.accept() {
@@ -122,6 +137,33 @@ impl Server {
                 eprintln!("failed to spawn connection thread from {peer}: {e}");
             }
         }
+    }
+
+    /// Starts the expiry sweeper, returning its stop handle.
+    ///
+    /// - sweeps every [`SWEEP_INTERVAL`]
+    /// - dropping the sender ends the loop; [`Server::serve`] joins it
+    /// - a spawn failure is logged; passive expiry still applies
+    fn spawn_sweeper(&self) -> (Option<thread::JoinHandle<()>>, mpsc::Sender<()>) {
+        let (stop, stopped) = mpsc::channel();
+        let store = Arc::clone(&self.store);
+        let spawned = thread::Builder::new()
+            .name("expiry-sweeper".into())
+            .spawn(move || {
+                while let Err(mpsc::RecvTimeoutError::Timeout) =
+                    stopped.recv_timeout(SWEEP_INTERVAL)
+                {
+                    let _ = store.sweep_expired(Instant::now());
+                }
+            });
+        let sweeper = match spawned {
+            Ok(sweeper) => Some(sweeper),
+            Err(e) => {
+                eprintln!("failed to spawn expiry sweeper: {e}");
+                None
+            }
+        };
+        (sweeper, stop)
     }
 }
 
@@ -209,7 +251,7 @@ fn handle_connection(stream: TcpStream, store: &Store) -> io::Result<Disconnecte
         let (reply, end) = match resp::read_request(&mut stream) {
             // `Ok(None)` is EOF at a frame boundary, not an error.
             Ok(None) => return Ok(Disconnected::Eof),
-            Ok(Some(args)) => match command::execute(store, &args) {
+            Ok(Some(args)) => match command::execute(store, &args, Instant::now()) {
                 // `*0` is a request with no command in it: nothing to reply with.
                 None => continue,
                 Some(executed) => (executed.reply, executed.close.then_some(Disconnected::Quit)),
@@ -292,6 +334,17 @@ mod tests {
             .map(|_| connections.try_acquire().expect("unlimited slot"))
             .collect();
         assert_eq!(permits.len(), 4);
+    }
+
+    #[test]
+    fn sweeper_stops_when_its_sender_drops() {
+        let server = Server::bind("127.0.0.1:0", Arc::new(Store::new())).expect("bind");
+        let (sweeper, stop) = server.spawn_sweeper();
+        drop(stop);
+        sweeper
+            .expect("sweeper spawned")
+            .join()
+            .expect("sweeper exits");
     }
 
     #[test]
