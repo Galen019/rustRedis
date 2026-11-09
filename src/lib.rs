@@ -3,20 +3,20 @@
 //! - [`Server`]: socket plumbing and the connection loop
 //! - `resp`: request framing and reply encoding
 //! - `command`: command dispatch over the [`Store`]
-//! - [`Store`]: in-memory key/value map
+//! - [`Store`]: in-memory key/value map with lazy expiry
 
 mod command;
 mod resp;
 mod store;
 
-pub use store::Store;
+pub use store::{Store, Ttl};
 
 use std::io::{self, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::resp::{Reply, RequestError};
 
@@ -209,7 +209,7 @@ fn handle_connection(stream: TcpStream, store: &Store) -> io::Result<Disconnecte
         let (reply, end) = match resp::read_request(&mut stream) {
             // `Ok(None)` is EOF at a frame boundary, not an error.
             Ok(None) => return Ok(Disconnected::Eof),
-            Ok(Some(args)) => match command::execute(store, &args) {
+            Ok(Some(args)) => match command::execute(store, &args, Instant::now()) {
                 // `*0` is a request with no command in it: nothing to reply with.
                 None => continue,
                 Some(executed) => (executed.reply, executed.close.then_some(Disconnected::Quit)),
