@@ -10,6 +10,7 @@ use std::fmt::Debug;
 use std::io;
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::thread;
 use std::time::Duration;
 
 use redis::{Client, Cmd, Connection, FromRedisValue};
@@ -62,12 +63,49 @@ fn run() -> Result<(), Box<dyn Error>> {
         "GET",
     )?;
     round_trip(&mut conn, redis::cmd("EXISTS").arg(KEY), 1i64, "EXISTS")?;
+
+    round_trip(
+        &mut conn,
+        redis::cmd("EXPIRE").arg(KEY).arg(10),
+        1i64,
+        "EXPIRE",
+    )?;
+    round_trip(&mut conn, redis::cmd("TTL").arg(KEY), 10i64, "TTL")?;
+    round_trip(&mut conn, redis::cmd("PERSIST").arg(KEY), 1i64, "PERSIST")?;
+    round_trip(
+        &mut conn,
+        redis::cmd("TTL").arg(KEY),
+        -1i64,
+        "TTL after PERSIST",
+    )?;
+
     round_trip(&mut conn, redis::cmd("DEL").arg(KEY), 1i64, "DEL")?;
     round_trip(
         &mut conn,
         redis::cmd("GET").arg(KEY),
         None::<String>,
         "GET after DEL",
+    )?;
+
+    // The only real-time check: a short TTL must elapse on the wire.
+    round_trip(
+        &mut conn,
+        redis::cmd("SET").arg(KEY).arg(VALUE).arg("PX").arg(50),
+        "OK".to_owned(),
+        "SET PX",
+    )?;
+    thread::sleep(Duration::from_millis(100));
+    round_trip(
+        &mut conn,
+        redis::cmd("GET").arg(KEY),
+        None::<String>,
+        "GET after expiry",
+    )?;
+    round_trip(
+        &mut conn,
+        redis::cmd("TTL").arg(KEY),
+        -2i64,
+        "TTL after expiry",
     )?;
 
     Ok(())

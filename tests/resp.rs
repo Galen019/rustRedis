@@ -1,8 +1,10 @@
+//! Network tests for the blocking RESP2 server.
+
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rust_redis::{Server, Store};
 
@@ -68,6 +70,31 @@ fn expect_reply(client: &mut TcpStream, expected: &[u8]) {
 fn expect_eof(client: &mut TcpStream) {
     let mut byte = [0u8; 1];
     assert_eq!(client.read(&mut byte).expect("read at eof"), 0);
+}
+
+/// Reads one integer reply and asserts it falls within `min..=max`.
+fn expect_integer_in_range(client: &mut TcpStream, min: i64, max: i64) {
+    let mut digits = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        client.read_exact(&mut byte).expect("read integer reply");
+        match byte[0] {
+            b'\r' => continue,
+            b'\n' => break,
+            byte => digits.push(byte),
+        }
+    }
+
+    let text = std::str::from_utf8(&digits).expect("utf8 integer reply");
+    let value: i64 = text
+        .strip_prefix(':')
+        .expect("integer reply prefix")
+        .parse()
+        .expect("integer reply value");
+    assert!(
+        (min..=max).contains(&value),
+        "integer reply {value} not in {min}..={max}"
+    );
 }
 
 #[test]
@@ -176,7 +203,7 @@ fn clients_share_one_store() {
 
     // The very store the threads use is visible to the test.
     assert_eq!(
-        store.get(b"shared").as_deref(),
+        store.get(b"shared", Instant::now()).as_deref(),
         Some(b"across clients".as_slice())
     );
 }
@@ -259,12 +286,104 @@ fn arity_and_syntax_errors() {
         b"-ERR wrong number of arguments for 'get' command\r\n",
     );
 
-    send(&mut client, &command(&[b"SET", b"k", b"v", b"EX", b"10"]));
+    send(&mut client, &command(&[b"SET", b"k", b"v", b"KEEPTTL"]));
     expect_reply(&mut client, b"-ERR syntax error\r\n");
 
     // The rejected `SET` stored nothing.
     send(&mut client, &command(&[b"GET", b"k"]));
     expect_reply(&mut client, b"$-1\r\n");
+}
+
+/// `EX`/`PX` install a TTL, `EXPIRE` replaces it, and `PERSIST` removes it.
+#[test]
+fn ttl_round_trips_without_waiting() {
+    let addr = start_server(Arc::new(Store::new()));
+    let mut client = connect(addr);
+
+    send(&mut client, &command(&[b"SET", b"k", b"v", b"EX", b"10"]));
+    expect_reply(&mut client, b"+OK\r\n");
+    // The exact remaining second depends on scheduling; the TTL itself does not.
+    send(&mut client, &command(&[b"TTL", b"k"]));
+    expect_integer_in_range(&mut client, 9, 10);
+
+    send(&mut client, &command(&[b"EXPIRE", b"k", b"100"]));
+    expect_reply(&mut client, b":1\r\n");
+    send(&mut client, &command(&[b"TTL", b"k"]));
+    expect_integer_in_range(&mut client, 99, 100);
+
+    send(&mut client, &command(&[b"PERSIST", b"k"]));
+    expect_reply(&mut client, b":1\r\n");
+    send(&mut client, &command(&[b"TTL", b"k"]));
+    expect_reply(&mut client, b":-1\r\n");
+
+    // A non-positive TTL expires the key immediately.
+    send(&mut client, &command(&[b"PEXPIRE", b"k", b"0"]));
+    expect_reply(&mut client, b":1\r\n");
+    send(&mut client, &command(&[b"GET", b"k"]));
+    expect_reply(&mut client, b"$-1\r\n");
+    send(&mut client, &command(&[b"EXISTS", b"k", b"k"]));
+    expect_reply(&mut client, b":0\r\n");
+    send(&mut client, &command(&[b"TTL", b"k"]));
+    expect_reply(&mut client, b":-2\r\n");
+}
+
+/// Expired keys are absent from every key-touching command.
+#[test]
+fn expired_keys_are_absent_after_immediate_expiry() {
+    let addr = start_server(Arc::new(Store::new()));
+    let mut client = connect(addr);
+
+    send(&mut client, &command(&[b"SET", b"k", b"v", b"PX", b"100"]));
+    expect_reply(&mut client, b"+OK\r\n");
+    send(&mut client, &command(&[b"PEXPIRE", b"k", b"0"]));
+    expect_reply(&mut client, b":1\r\n");
+
+    send(&mut client, &command(&[b"DEL", b"k", b"k"]));
+    expect_reply(&mut client, b":0\r\n");
+    send(&mut client, &command(&[b"EXPIRE", b"k", b"10"]));
+    expect_reply(&mut client, b":0\r\n");
+    send(&mut client, &command(&[b"PERSIST", b"k"]));
+    expect_reply(&mut client, b":0\r\n");
+    send(&mut client, &command(&[b"PTTL", b"k"]));
+    expect_reply(&mut client, b":-2\r\n");
+}
+
+/// Bad expiry arguments keep their exact Redis error frames.
+#[test]
+fn expiry_argument_errors() {
+    let addr = start_server(Arc::new(Store::new()));
+    let mut client = connect(addr);
+
+    send(&mut client, &command(&[b"SET", b"k", b"v", b"EX", b"0"]));
+    expect_reply(
+        &mut client,
+        b"-ERR invalid expire time in 'set' command\r\n",
+    );
+
+    send(&mut client, &command(&[b"SET", b"k", b"v", b"EX", b"abc"]));
+    expect_reply(
+        &mut client,
+        b"-ERR value is not an integer or out of range\r\n",
+    );
+
+    send(&mut client, &command(&[b"EXPIRE", b"k", b"abc"]));
+    expect_reply(
+        &mut client,
+        b"-ERR value is not an integer or out of range\r\n",
+    );
+
+    send(&mut client, &command(&[b"EXPIRE", b"k", b"10", b"NX"]));
+    expect_reply(
+        &mut client,
+        b"-ERR wrong number of arguments for 'expire' command\r\n",
+    );
+
+    // Syntax is checked across the whole option list before the number.
+    send(
+        &mut client,
+        &command(&[b"SET", b"k", b"v", b"EX", b"0", b"foo"]),
+    );
+    expect_reply(&mut client, b"-ERR syntax error\r\n");
 }
 
 #[test]
