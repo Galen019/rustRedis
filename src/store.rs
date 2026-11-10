@@ -1,13 +1,13 @@
 //! Binary-safe in-memory key/value store with lazy expiry.
 //!
-//! - one `RwLock<HashMap<Vec<u8>, Entry>>`, shareable as `Arc<Store>`
+//! - one `Mutex<HashMap<Vec<u8>, Entry>>`, shareable as `Arc<Store>`
 //! - a key is dead once `now` reaches its deadline
 //! - expired entries are removed only when accessed
 //! - conditional writes take one lock and report the previous value
 //! - a poisoned lock panics
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 type Map = HashMap<Vec<u8>, Entry>;
@@ -19,6 +19,13 @@ struct Entry {
 }
 
 impl Entry {
+    fn new(value: &[u8], expires_at: Option<Instant>) -> Self {
+        Self {
+            value: Arc::from(value),
+            expires_at,
+        }
+    }
+
     /// A key is dead once its deadline is reached.
     fn is_expired(&self, now: Instant) -> bool {
         self.expires_at.is_some_and(|deadline| deadline <= now)
@@ -40,6 +47,11 @@ fn live<'a>(map: &'a mut Map, key: &[u8], now: Instant) -> Option<&'a mut Entry>
         return None;
     }
     map.get_mut(key)
+}
+
+/// Inserts a fresh entry, replacing any existing one.
+fn insert(map: &mut Map, key: &[u8], value: &[u8], expires_at: Option<Instant>) {
+    map.insert(key.to_vec(), Entry::new(value, expires_at));
 }
 
 /// Whether a key is absent, persistent, or expiring.
@@ -83,7 +95,7 @@ pub(crate) struct SetOutcome {
 /// Shared map from byte keys to byte values and optional deadlines.
 #[derive(Default)]
 pub struct Store {
-    inner: RwLock<Map>,
+    inner: Mutex<Map>,
 }
 
 impl Store {
@@ -94,24 +106,19 @@ impl Store {
 
     /// Returns a snapshot of the value for `key`, or `None` if it is absent or expired.
     pub fn get(&self, key: &[u8], now: Instant) -> Option<Arc<[u8]>> {
-        let mut map = self.write();
+        let mut map = self.lock();
         live(&mut map, key, now).map(|entry| Arc::clone(&entry.value))
     }
 
     /// Inserts or replaces the value for `key`, with an optional deadline.
     pub fn set(&self, key: &[u8], value: &[u8], expires_at: Option<Instant>) {
-        self.write().insert(
-            key.to_vec(),
-            Entry {
-                value: Arc::from(value),
-                expires_at,
-            },
-        );
+        let mut map = self.lock();
+        insert(&mut map, key, value, expires_at);
     }
 
     /// Inserts `value` when `condition` allows it.
     ///
-    /// - one write lock for the eviction, decision, and insert
+    /// - one lock for the eviction, decision, and insert
     /// - `previous` is the live value before the decision, so `GET` can report it
     /// - a rejected condition leaves value and deadline untouched
     /// - `TtlPolicy::Keep` keeps the surviving deadline
@@ -123,7 +130,7 @@ impl Store {
         condition: Condition,
         now: Instant,
     ) -> SetOutcome {
-        let mut map = self.write();
+        let mut map = self.lock();
         let previous = live(&mut map, key, now).map(|entry| Arc::clone(&entry.value));
         let found = previous.is_some();
         let allowed = match condition {
@@ -143,13 +150,7 @@ impl Store {
             TtlPolicy::Keep => map.get(key).and_then(|entry| entry.expires_at),
             TtlPolicy::Expire(deadline) => Some(deadline),
         };
-        map.insert(
-            key.to_vec(),
-            Entry {
-                value: Arc::from(value),
-                expires_at,
-            },
-        );
+        insert(&mut map, key, value, expires_at);
         SetOutcome {
             applied: true,
             previous,
@@ -163,11 +164,11 @@ impl Store {
 
     /// Removes `keys`, returning how many live entries were present.
     ///
-    /// - one write lock for the whole batch
+    /// - one lock for the whole batch
     /// - expired entries are removed but not counted
     /// - duplicate keys count once: the second removal finds nothing
     pub fn del_many<'a>(&self, keys: impl IntoIterator<Item = &'a [u8]>, now: Instant) -> usize {
-        let mut map = self.write();
+        let mut map = self.lock();
         keys.into_iter()
             .filter(|&key| map.remove(key).is_some_and(|entry| !entry.is_expired(now)))
             .count()
@@ -180,11 +181,11 @@ impl Store {
 
     /// Counts how many of `keys` are present and live.
     ///
-    /// - one write lock for the whole batch
+    /// - one lock for the whole batch
     /// - expired entries are removed and not counted
     /// - duplicate keys count once per occurrence
     pub fn exists_many<'a>(&self, keys: impl IntoIterator<Item = &'a [u8]>, now: Instant) -> usize {
-        let mut map = self.write();
+        let mut map = self.lock();
         keys.into_iter()
             .filter(|&key| live(&mut map, key, now).is_some())
             .count()
@@ -192,7 +193,7 @@ impl Store {
 
     /// Reports whether `key` is absent, persistent, or expiring.
     pub fn ttl(&self, key: &[u8], now: Instant) -> Ttl {
-        let mut map = self.write();
+        let mut map = self.lock();
         live(&mut map, key, now).map_or(Ttl::Missing, |entry| entry.ttl(now))
     }
 
@@ -201,28 +202,28 @@ impl Store {
     /// - `false` when the key is absent or already expired
     /// - a deadline at or before `now` removes the key and reports `true`
     pub fn set_expiry(&self, key: &[u8], deadline: Instant, now: Instant) -> bool {
-        let mut map = self.write();
-        if live(&mut map, key, now).is_none() {
+        let mut map = self.lock();
+        let Some(entry) = live(&mut map, key, now) else {
             return false;
-        }
+        };
         if deadline <= now {
             map.remove(key);
         } else {
-            map.get_mut(key).expect("live entry disappeared").expires_at = Some(deadline);
+            entry.expires_at = Some(deadline);
         }
         true
     }
 
     /// Removes the deadline from a live `key`, returning whether one was set.
     pub fn persist(&self, key: &[u8], now: Instant) -> bool {
-        let mut map = self.write();
+        let mut map = self.lock();
         live(&mut map, key, now).is_some_and(|entry| entry.expires_at.take().is_some())
     }
 
     // A panic while the lock is held poisons it: another thread may have died
     // mid-write, so recovering could serve corruption silently.
-    fn write(&self) -> RwLockWriteGuard<'_, Map> {
-        self.inner.write().expect("store lock poisoned")
+    fn lock(&self) -> MutexGuard<'_, Map> {
+        self.inner.lock().expect("store lock poisoned")
     }
 }
 
@@ -237,7 +238,7 @@ mod tests {
     const THREADS: usize = 8;
 
     fn map_len(store: &Store) -> usize {
-        store.inner.read().expect("lock").len()
+        store.inner.lock().expect("lock").len()
     }
 
     fn value_of(store: &Store, key: &[u8]) -> Option<Vec<u8>> {
@@ -245,18 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_entry_is_removed_on_get() {
-        let store = Store::new();
-        let now = Instant::now();
-        store.set(b"k", b"v", Some(now));
-
-        assert_eq!(map_len(&store), 1);
-        assert_eq!(store.get(b"k", now), None);
-        assert_eq!(map_len(&store), 0);
-    }
-
-    #[test]
-    fn live_entry_survives_before_its_deadline() {
+    fn expiry_hides_and_evicts_on_access() {
         let store = Store::new();
         let now = Instant::now();
         let deadline = now + Duration::from_secs(10);
@@ -264,19 +254,11 @@ mod tests {
 
         assert_eq!(store.get(b"k", now).as_deref(), Some(b"v".as_slice()));
         assert_eq!(store.ttl(b"k", now), Ttl::Expiring(Duration::from_secs(10)));
+
+        // The deadline itself is already expired.
         assert_eq!(store.ttl(b"k", deadline), Ttl::Missing);
-        assert_eq!(map_len(&store), 0);
-    }
-
-    #[test]
-    fn plain_set_clears_a_deadline() {
-        let store = Store::new();
-        let now = Instant::now();
-        store.set(b"k", b"v", Some(now + Duration::from_secs(10)));
-        store.set(b"k", b"other", None);
-
-        assert_eq!(store.ttl(b"k", now), Ttl::Persistent);
-        assert_eq!(store.get(b"k", now).as_deref(), Some(b"other".as_slice()));
+        assert_eq!(map_len(&store), 0, "access at the deadline evicts it");
+        assert!(!store.exists(b"k", now));
     }
 
     #[test]
@@ -375,13 +357,16 @@ mod tests {
     }
 
     #[test]
-    fn set_expiry_replaces_or_deletes() {
+    fn set_expiry_installs_replaces_and_deletes() {
         let store = Store::new();
         let now = Instant::now();
         store.set(b"k", b"v", None);
 
         assert!(store.set_expiry(b"k", now + Duration::from_secs(5), now));
         assert_eq!(store.ttl(b"k", now), Ttl::Expiring(Duration::from_secs(5)));
+
+        assert!(store.set_expiry(b"k", now + Duration::from_secs(9), now));
+        assert_eq!(store.ttl(b"k", now), Ttl::Expiring(Duration::from_secs(9)));
 
         // A deadline at `now` deletes immediately.
         assert!(store.set_expiry(b"k", now, now));
@@ -405,43 +390,39 @@ mod tests {
     }
 
     #[test]
-    fn del_counts_only_live_entries() {
+    fn batch_helpers_ignore_expired_entries() {
         let store = Store::new();
         let now = Instant::now();
-        store.set(b"live", b"v", None);
-        store.set(b"dead", b"v", Some(now));
+        store.set(b"live", b"1", None);
+        store.set(b"dead", b"2", Some(now));
+        store.set(b"expired", b"3", Some(now));
 
         assert_eq!(store.del_many([b"dead".as_slice()], now), 0);
-        assert_eq!(store.del_many([b"live".as_slice()], now), 1);
+        assert_eq!(
+            store.exists_many([b"live".as_slice(), b"live", b"expired"], now),
+            2
+        );
+        assert_eq!(store.del_many([b"live".as_slice(), b"live"], now), 1);
         assert_eq!(store.del_many([b"live".as_slice()], now), 0);
         assert_eq!(map_len(&store), 0);
     }
 
     #[test]
-    fn exists_counts_live_duplicates_and_prunes_expired() {
+    fn binary_keys_and_values_round_trip() {
         let store = Store::new();
         let now = Instant::now();
-        store.set(b"live", b"v", None);
-        store.set(b"dead", b"v", Some(now));
 
-        assert_eq!(
-            store.exists_many([b"live".as_slice(), b"live", b"dead"], now),
-            2
-        );
-        assert_eq!(store.exists_many([b"dead".as_slice()], now), 0);
-        assert_eq!(map_len(&store), 1);
-    }
-
-    #[test]
-    fn binary_keys_with_deadlines_round_trip() {
-        let store = Store::new();
-        let now = Instant::now();
-        let key: &[u8] = &[0x00, 0x80, 0xFF];
-        let value: &[u8] = &[0xFF, b'\r', b'\n', 0x00];
+        // NUL, a lone continuation byte, 0xFF, and an encoded surrogate.
+        let key: &[u8] = &[0x00, 0x80, 0xFF, 0xFE, 0xED, 0xA0, 0x80];
+        let value: &[u8] = &[0xFF, 0x00, 0xC3, 0x28];
 
         store.set(key, value, Some(now + Duration::from_secs(1)));
         assert_eq!(store.get(key, now).as_deref(), Some(value));
+        assert!(store.exists(key, now));
         assert_eq!(store.ttl(key, now), Ttl::Expiring(Duration::from_secs(1)));
+
+        assert!(store.del(key, now));
+        assert_eq!(store.get(key, now), None);
     }
 
     /// Covers miss, hit, overwrite, delete, and delete-again.
@@ -484,24 +465,6 @@ mod tests {
         assert_eq!(store.exists(b"k", now), value_of(&store, b"k").is_some());
     }
 
-    /// Keys and values round-trip bytes that are invalid UTF-8.
-    #[test]
-    fn binary_keys_and_values_round_trip() {
-        let store = Store::new();
-        let now = Instant::now();
-
-        // NUL, a lone continuation byte, 0xFF, and an encoded surrogate.
-        let key: &[u8] = &[0x00, 0x80, 0xFF, 0xFE, 0xED, 0xA0, 0x80];
-        let value: &[u8] = &[0xFF, 0x00, 0xC3, 0x28];
-
-        store.set(key, value, None);
-        assert_eq!(value_of(&store, key).as_deref(), Some(value));
-        assert!(store.exists(key, now));
-
-        assert!(store.del(key, now));
-        assert_eq!(value_of(&store, key), None);
-    }
-
     /// Empty keys and empty values are present, not absent.
     #[test]
     fn empty_key_and_empty_value_are_present() {
@@ -519,23 +482,6 @@ mod tests {
 
         // The empty key did not overwrite the other key nor alias it.
         assert_eq!(value_of(&store, b"present"), Some(Vec::new()));
-    }
-
-    /// A deadline hides the value and the first access removes it.
-    #[test]
-    fn expiry_is_lazy_and_removes_on_access() {
-        let store = Store::new();
-        let now = Instant::now();
-        let deadline = now + Duration::from_secs(10);
-
-        store.set(b"k", b"v", Some(deadline));
-        assert_eq!(store.get(b"k", now).as_deref(), Some(b"v".as_slice()));
-        assert_eq!(store.ttl(b"k", now), Ttl::Expiring(Duration::from_secs(10)));
-
-        // The deadline itself is already expired.
-        assert_eq!(store.get(b"k", deadline), None);
-        assert!(!store.exists(b"k", now));
-        assert_eq!(store.ttl(b"k", now), Ttl::Missing);
     }
 
     /// `set`, `set_expiry`, and `persist` manage deadlines.
@@ -559,37 +505,6 @@ mod tests {
         store.set(b"k", b"fresh", None);
         assert_eq!(store.ttl(b"k", now), Ttl::Persistent);
         assert_eq!(store.get(b"k", now).as_deref(), Some(b"fresh".as_slice()));
-    }
-
-    /// A non-positive deadline deletes, and absent keys report no deadline.
-    #[test]
-    fn set_expiry_on_past_deadline_deletes() {
-        let store = Store::new();
-        let now = Instant::now();
-
-        store.set(b"k", b"v", None);
-        assert!(store.set_expiry(b"k", now, now));
-        assert!(!store.exists(b"k", now));
-        assert!(!store.set_expiry(b"missing", now, now));
-        assert!(!store.persist(b"missing", now));
-    }
-
-    /// Expired entries are removed but not counted.
-    #[test]
-    fn batch_helpers_ignore_expired_entries() {
-        let store = Store::new();
-        let now = Instant::now();
-
-        store.set(b"live", b"1", None);
-        store.set(b"dead", b"2", Some(now));
-
-        assert_eq!(
-            store.exists_many([b"live".as_slice(), b"live", b"dead"], now),
-            2
-        );
-        assert_eq!(store.del_many([b"dead".as_slice()], now), 0);
-        assert_eq!(store.del_many([b"live".as_slice(), b"live"], now), 1);
-        assert_eq!(store.exists_many([b"live".as_slice()], now), 0);
     }
 
     /// Disjoint keys written concurrently: no cross-talk, no deadlock.
@@ -646,7 +561,7 @@ mod tests {
         assert!(store.exists(b"b", now));
     }
 
-    /// Concurrent readers see whole snapshots while a writer replaces the value.
+    /// Readers see whole snapshots while a writer replaces the value.
     #[test]
     fn readers_never_observe_torn_values() {
         const READERS: usize = 4;
