@@ -6,9 +6,9 @@ A minimal RESP2 Redis-like server in Rust.
 
 - Binds `127.0.0.1:6379` and accepts connections forever: blocking `std::net`, one detached thread per connection, no deps, no async runtime.
 - Speaks RESP2: requests are arrays of bulk strings; replies are simple strings, bulk strings, integers, and errors. No inline commands, no RESP3.
-- Commands: `GET`, `SET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `PING`, `QUIT`. `SET` accepts a key and value plus optional `EX <seconds>` or `PX <milliseconds>`; other options (`NX`, `XX`, `KEEPTTL`, `GET`, `EXAT`, `PXAT`) are syntax errors.
-- An in-memory key/value store (`src/store.rs`): `get`, `set`, `del`, `del_many`, `exists`, `exists_many`, `ttl`, `set_expiry`, `persist` over binary-safe `Vec<u8>` keys and `Arc<[u8]>` values, backed by a single `RwLock<HashMap<_, Entry>>`, shared across connection threads as `Arc<Store>`. Each entry carries an optional monotonic `Instant` deadline; `set` takes that deadline as a third argument (`None` clears any old one).
-- Lazy expiry (`src/store.rs`): a key is dead once `now` reaches its deadline. Commands that touch a key treat an expired entry as absent and physically remove it on access, so there is no background sweeper and keys that are never accessed can linger. `TTL` returns `-2` for a missing/expired key and `-1` for a key with no deadline, rounding to the nearest second like Redis; `PTTL` reports exact milliseconds.
+- Commands: `GET`, `SET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `PING`, `QUIT`. `SET` accepts optional `NX`, `XX`, `KEEPTTL`, and `GET`, plus `EX <seconds>` or `PX <milliseconds>`. `NX`/`XX` gate the write, `KEEPTTL` preserves the existing deadline, and `GET` returns the previous value instead of `+OK`. `EXAT`/`PXAT` are syntax errors.
+- An in-memory key/value store (`src/store.rs`): `get`, `set`, `set_if`, `del`, `del_many`, `exists`, `exists_many`, `ttl`, `set_expiry`, `persist` over binary-safe `Vec<u8>` keys and `Arc<[u8]>` values, backed by a single `Mutex<HashMap<_, Entry>>`, shared across connection threads as `Arc<Store>`. Each entry carries an optional monotonic `Instant` deadline; `set` takes that deadline as a third argument (`None` clears any old one), while `set_if` gates the write on a condition and keeps or replaces the deadline under one lock.
+- Lazy expiry (`src/store.rs`): a key is dead once `now` reaches its deadline. Commands that touch a key treat an expired entry as absent and physically remove it on access, so there is no background sweeper and keys that are never accessed can linger. `TTL` returns `-2` for a missing/expired key and `-1` for a key with no deadline, rounding to the nearest second like Redis; `PTTL` reports exact milliseconds. Relative TTL parsing and deadline arithmetic live in `src/expiry.rs`.
 - Optional idle timeout (`src/lib.rs`): `Server::idle_timeout(Some(duration))` arms read and write timeouts, so a connection that stalls mid-request or stops draining replies is closed. `None` or a zero duration leaves sockets blocking, and the binary leaves it disabled.
 - A connection cap (`src/lib.rs`): `Server::max_connections(Some(n))` serves at most `n` connections at once; extra peers get `-ERR max number of clients reached` and are closed. `None` (the default) or `Some(0)` means unlimited, and the binary caps at `Some(10_000)` unless `REDIS_MAX_CONNECTIONS` overrides it. A silent client holds a slot until it closes or an idle timeout fires.
 
@@ -38,7 +38,7 @@ It targets `127.0.0.1:6379` by default; pass another address with `cargo run --e
 
 ## Not yet
 
-- Absolute-time expiry (`EXPIREAT`/`PEXPIREAT`, `SET ... EXAT/PXAT`) and the remaining `SET` options (`NX`, `XX`, `KEEPTTL`, `GET`).
+- Absolute-time expiry (`EXPIREAT`/`PEXPIREAT`, `SET ... EXAT/PXAT`).
 - Persistence, and value types beyond opaque bytes (lists, hashes, sets).
 - `MULTI`/transactions, keyspace notifications, pub/sub, clustering.
 - RESP3 (`HELLO`), inline commands, and the `COMMAND` introspection commands.

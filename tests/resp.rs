@@ -286,12 +286,72 @@ fn arity_and_syntax_errors() {
         b"-ERR wrong number of arguments for 'get' command\r\n",
     );
 
-    send(&mut client, &command(&[b"SET", b"k", b"v", b"KEEPTTL"]));
-    expect_reply(&mut client, b"-ERR syntax error\r\n");
+    for parts in [
+        &[b"SET".as_slice(), b"k", b"v", b"EXAT", b"10"][..],
+        &[b"SET".as_slice(), b"k", b"v", b"NX", b"XX"][..],
+        &[b"SET".as_slice(), b"k", b"v", b"XX", b"NX"][..],
+        &[b"SET".as_slice(), b"k", b"v", b"KEEPTTL", b"EX", b"10"][..],
+        &[b"SET".as_slice(), b"k", b"v", b"EX", b"10", b"KEEPTTL"][..],
+    ] {
+        send(&mut client, &command(parts));
+        expect_reply(&mut client, b"-ERR syntax error\r\n");
+    }
 
     // The rejected `SET` stored nothing.
     send(&mut client, &command(&[b"GET", b"k"]));
     expect_reply(&mut client, b"$-1\r\n");
+}
+
+/// `NX`/`XX` gate the write, `GET` replies with the old value, and `KEEPTTL` keeps the deadline.
+#[test]
+fn set_options_over_the_wire() {
+    let addr = start_server(Arc::new(Store::new()));
+    let mut client = connect(addr);
+
+    send(&mut client, &command(&[b"SET", b"k", b"v"]));
+    expect_reply(&mut client, b"+OK\r\n");
+
+    // NX on a live key is nil; XX on a missing key creates nothing.
+    send(&mut client, &command(&[b"SET", b"k", b"v2", b"NX"]));
+    expect_reply(&mut client, b"$-1\r\n");
+    send(&mut client, &command(&[b"GET", b"k"]));
+    expect_reply(&mut client, b"$1\r\nv\r\n");
+
+    send(&mut client, &command(&[b"SET", b"k", b"v2", b"XX"]));
+    expect_reply(&mut client, b"+OK\r\n");
+
+    send(&mut client, &command(&[b"SET", b"other", b"v", b"XX"]));
+    expect_reply(&mut client, b"$-1\r\n");
+    send(
+        &mut client,
+        &command(&[b"SET", b"other", b"v", b"XX", b"GET"]),
+    );
+    expect_reply(&mut client, b"$-1\r\n");
+    send(&mut client, &command(&[b"EXISTS", b"other"]));
+    expect_reply(&mut client, b":0\r\n");
+
+    // GET replies with the old value, never `+OK`.
+    send(&mut client, &command(&[b"SET", b"k", b"v3", b"GET"]));
+    expect_reply(&mut client, b"$2\r\nv2\r\n");
+
+    // NX GET on a live key replies the old value and does not write.
+    send(&mut client, &command(&[b"SET", b"k", b"v4", b"NX", b"GET"]));
+    expect_reply(&mut client, b"$2\r\nv3\r\n");
+    send(&mut client, &command(&[b"GET", b"k"]));
+    expect_reply(&mut client, b"$2\r\nv3\r\n");
+
+    // KEEPTTL keeps the deadline; a plain SET clears it.
+    send(&mut client, &command(&[b"SET", b"k", b"v5", b"EX", b"10"]));
+    expect_reply(&mut client, b"+OK\r\n");
+    send(&mut client, &command(&[b"SET", b"k", b"v6", b"KEEPTTL"]));
+    expect_reply(&mut client, b"+OK\r\n");
+    send(&mut client, &command(&[b"TTL", b"k"]));
+    expect_integer_in_range(&mut client, 9, 10);
+
+    send(&mut client, &command(&[b"SET", b"k", b"v7"]));
+    expect_reply(&mut client, b"+OK\r\n");
+    send(&mut client, &command(&[b"TTL", b"k"]));
+    expect_reply(&mut client, b":-1\r\n");
 }
 
 /// `EX`/`PX` install a TTL, `EXPIRE` replaces it, and `PERSIST` removes it.

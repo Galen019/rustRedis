@@ -3,9 +3,11 @@
 //! - [`Server`]: socket plumbing and the connection loop
 //! - `resp`: request framing and reply encoding
 //! - `command`: command dispatch over the [`Store`]
+//! - `expiry`: relative TTL parsing and deadline math
 //! - [`Store`]: in-memory key/value map with lazy expiry
 
 mod command;
+mod expiry;
 mod resp;
 mod store;
 
