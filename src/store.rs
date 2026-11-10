@@ -3,6 +3,7 @@
 //! - one `RwLock<HashMap<Vec<u8>, Entry>>`, shareable as `Arc<Store>`
 //! - a key is dead once `now` reaches its deadline
 //! - expired entries are removed only when accessed
+//! - conditional writes take one lock and report the previous value
 //! - a poisoned lock panics
 
 use std::collections::HashMap;
@@ -52,6 +53,33 @@ pub enum Ttl {
     Expiring(Duration),
 }
 
+/// Whether a write applies unconditionally or only when the key is absent/present.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Condition {
+    Always,
+    Nx,
+    Xx,
+}
+
+/// What a write does with an existing deadline.
+#[derive(Clone, Copy)]
+pub(crate) enum TtlPolicy {
+    /// Drop any deadline.
+    Clear,
+    /// Keep the surviving entry's deadline; absent keys stay persistent.
+    Keep,
+    /// Install a new deadline.
+    Expire(Instant),
+}
+
+/// Result of a conditional write.
+pub(crate) struct SetOutcome {
+    /// Whether the condition allowed the write.
+    pub applied: bool,
+    /// Value before the write; `None` when it was absent or expired.
+    pub previous: Option<Arc<[u8]>>,
+}
+
 /// Shared map from byte keys to byte values and optional deadlines.
 #[derive(Default)]
 pub struct Store {
@@ -79,6 +107,53 @@ impl Store {
                 expires_at,
             },
         );
+    }
+
+    /// Inserts `value` when `condition` allows it.
+    ///
+    /// - one write lock for the eviction, decision, and insert
+    /// - `previous` is the live value before the decision, so `GET` can report it
+    /// - a rejected condition leaves value and deadline untouched
+    /// - `TtlPolicy::Keep` keeps the surviving deadline
+    pub(crate) fn set_if(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: TtlPolicy,
+        condition: Condition,
+        now: Instant,
+    ) -> SetOutcome {
+        let mut map = self.write();
+        let previous = live(&mut map, key, now).map(|entry| Arc::clone(&entry.value));
+        let found = previous.is_some();
+        let allowed = match condition {
+            Condition::Always => true,
+            Condition::Nx => !found,
+            Condition::Xx => found,
+        };
+        if !allowed {
+            return SetOutcome {
+                applied: false,
+                previous,
+            };
+        }
+
+        let expires_at = match ttl {
+            TtlPolicy::Clear => None,
+            TtlPolicy::Keep => map.get(key).and_then(|entry| entry.expires_at),
+            TtlPolicy::Expire(deadline) => Some(deadline),
+        };
+        map.insert(
+            key.to_vec(),
+            Entry {
+                value: Arc::from(value),
+                expires_at,
+            },
+        );
+        SetOutcome {
+            applied: true,
+            previous,
+        }
     }
 
     /// Removes `key`, returning whether a live entry was present.
@@ -202,6 +277,101 @@ mod tests {
 
         assert_eq!(store.ttl(b"k", now), Ttl::Persistent);
         assert_eq!(store.get(b"k", now).as_deref(), Some(b"other".as_slice()));
+    }
+
+    #[test]
+    fn set_if_conditions_gate_writes() {
+        let store = Store::new();
+        let now = Instant::now();
+
+        let outcome = store.set_if(b"k", b"first", TtlPolicy::Clear, Condition::Nx, now);
+        assert!(outcome.applied);
+        assert_eq!(outcome.previous, None);
+
+        let outcome = store.set_if(b"k", b"second", TtlPolicy::Clear, Condition::Nx, now);
+        assert!(!outcome.applied);
+        assert_eq!(outcome.previous.as_deref(), Some(b"first".as_slice()));
+        assert_eq!(value_of(&store, b"k").as_deref(), Some(b"first".as_slice()));
+
+        let outcome = store.set_if(b"k", b"third", TtlPolicy::Clear, Condition::Xx, now);
+        assert!(outcome.applied);
+        assert_eq!(outcome.previous.as_deref(), Some(b"first".as_slice()));
+
+        let outcome = store.set_if(b"missing", b"v", TtlPolicy::Clear, Condition::Xx, now);
+        assert!(!outcome.applied);
+        assert_eq!(outcome.previous, None);
+        assert!(!store.exists(b"missing", now));
+    }
+
+    #[test]
+    fn set_if_treats_expired_entries_as_absent() {
+        let store = Store::new();
+        let now = Instant::now();
+        store.set(b"k", b"dead", Some(now));
+
+        let outcome = store.set_if(b"k", b"fresh", TtlPolicy::Clear, Condition::Nx, now);
+        assert!(outcome.applied);
+        assert_eq!(outcome.previous, None, "an expired entry has no value");
+        assert_eq!(value_of(&store, b"k").as_deref(), Some(b"fresh".as_slice()));
+    }
+
+    #[test]
+    fn set_if_keep_preserves_the_deadline_and_clear_removes_it() {
+        let store = Store::new();
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(10);
+
+        store.set(b"k", b"v", Some(deadline));
+        let outcome = store.set_if(b"k", b"other", TtlPolicy::Keep, Condition::Always, now);
+        assert!(outcome.applied);
+        assert_eq!(store.ttl(b"k", now), Ttl::Expiring(Duration::from_secs(10)));
+
+        let outcome = store.set_if(b"k", b"fresh", TtlPolicy::Clear, Condition::Always, now);
+        assert!(outcome.applied);
+        assert_eq!(store.ttl(b"k", now), Ttl::Persistent);
+
+        // Keep on an absent key leaves it persistent.
+        let outcome = store.set_if(b"new", b"v", TtlPolicy::Keep, Condition::Always, now);
+        assert!(outcome.applied);
+        assert_eq!(store.ttl(b"new", now), Ttl::Persistent);
+    }
+
+    #[test]
+    fn set_if_expire_installs_a_deadline() {
+        let store = Store::new();
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(1500);
+
+        let outcome = store.set_if(
+            b"k",
+            b"v",
+            TtlPolicy::Expire(deadline),
+            Condition::Always,
+            now,
+        );
+        assert!(outcome.applied);
+        assert_eq!(
+            store.ttl(b"k", now),
+            Ttl::Expiring(Duration::from_millis(1500))
+        );
+    }
+
+    #[test]
+    fn rejected_set_if_changes_nothing() {
+        let store = Store::new();
+        let now = Instant::now();
+        store.set(b"k", b"v", Some(now + Duration::from_secs(10)));
+
+        let outcome = store.set_if(
+            b"k",
+            b"new",
+            TtlPolicy::Expire(now + Duration::from_secs(99)),
+            Condition::Nx,
+            now,
+        );
+        assert!(!outcome.applied);
+        assert_eq!(value_of(&store, b"k").as_deref(), Some(b"v".as_slice()));
+        assert_eq!(store.ttl(b"k", now), Ttl::Expiring(Duration::from_secs(10)));
     }
 
     #[test]

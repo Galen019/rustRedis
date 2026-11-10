@@ -2,14 +2,14 @@
 //!
 //! - socket-free: name matching, arity checks, store access only
 //! - expiry is relative only: `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, and `SET ... EX/PX`
+//! - `SET` also accepts `NX`, `XX`, `KEEPTTL`, and `GET`; `EXAT`/`PXAT` stay syntax errors
 //! - the caller passes one `now` per request to drive lazy eviction
-//! - other `SET` options are syntax errors
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::resp::{Reply, escaped};
-use crate::store::{Store, Ttl};
+use crate::store::{Condition, Store, Ttl, TtlPolicy};
 
 /// A reply plus whether the connection closes after sending it.
 pub struct Executed {
@@ -82,16 +82,26 @@ fn set(store: &Store, args: &[Vec<u8>], now: Instant) -> Reply {
         return Reply::Error("ERR syntax error".into());
     };
 
-    let deadline = match options {
-        SetOptions::NoExpiry => None,
-        SetOptions::Expiry { unit, raw } => match expire_deadline(unit, raw, now) {
-            Ok(deadline) => Some(deadline),
+    let ttl = match options.expiry {
+        Some((unit, raw)) => match expire_deadline(unit, raw, now) {
+            Ok(deadline) => TtlPolicy::Expire(deadline),
             Err(reply) => return reply,
+        },
+        None => match options.ttl {
+            TtlChoice::Clear => TtlPolicy::Clear,
+            TtlChoice::Keep => TtlPolicy::Keep,
         },
     };
 
-    store.set(key, value, deadline);
-    Reply::Simple("OK")
+    let outcome = store.set_if(key, value, ttl, options.condition, now);
+
+    if options.get {
+        Reply::Bulk(outcome.previous)
+    } else if outcome.applied {
+        Reply::Simple("OK")
+    } else {
+        Reply::Bulk(None)
+    }
 }
 
 fn del(store: &Store, args: &[Vec<u8>], now: Instant) -> Reply {
@@ -189,41 +199,84 @@ enum TimeUnit {
 }
 
 /// Parsed `SET` options.
-enum SetOptions<'a> {
-    NoExpiry,
-    Expiry { unit: TimeUnit, raw: &'a [u8] },
+struct SetOptions<'a> {
+    condition: Condition,
+    ttl: TtlChoice,
+    get: bool,
+    expiry: Option<(TimeUnit, &'a [u8])>,
 }
 
-/// Parses `SET` options.
+/// What `SET` does with an existing deadline when no `EX`/`PX` is given.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TtlChoice {
+    Clear,
+    Keep,
+}
+
+/// Parses `SET` options with Redis's order-sensitive rules.
 ///
+/// - `NX` and `XX` may repeat but conflict with each other in either order
+/// - `KEEPTTL` conflicts with `EX`/`PX` in either order
+/// - duplicate `EX`/`PX` is allowed; the last one wins; mixing units is a syntax error
 /// - `None` is a syntax error
-/// - duplicate `EX`/`PX` is allowed; the last one wins
-/// - mixing `EX` and `PX` is a syntax error
 fn parse_set_options(options: &[Vec<u8>]) -> Option<SetOptions<'_>> {
+    let mut condition = Condition::Always;
+    let mut ttl = TtlChoice::Clear;
+    let mut get = false;
     let mut expiry: Option<(TimeUnit, &[u8])> = None;
     let mut index = 0;
 
     while index < options.len() {
         let option = &options[index];
         let unit = if option.eq_ignore_ascii_case(b"ex") {
-            TimeUnit::Seconds
+            Some(TimeUnit::Seconds)
         } else if option.eq_ignore_ascii_case(b"px") {
-            TimeUnit::Millis
+            Some(TimeUnit::Millis)
         } else {
-            return None;
+            None
         };
 
-        if expiry.is_some_and(|(seen, _)| seen != unit) {
+        if let Some(unit) = unit {
+            if ttl == TtlChoice::Keep {
+                return None;
+            }
+            if expiry.is_some_and(|(seen, _)| seen != unit) {
+                return None;
+            }
+            let raw = options.get(index + 1).map(Vec::as_slice)?;
+            expiry = Some((unit, raw));
+            index += 2;
+            continue;
+        }
+
+        if option.eq_ignore_ascii_case(b"nx") {
+            if condition == Condition::Xx {
+                return None;
+            }
+            condition = Condition::Nx;
+        } else if option.eq_ignore_ascii_case(b"xx") {
+            if condition == Condition::Nx {
+                return None;
+            }
+            condition = Condition::Xx;
+        } else if option.eq_ignore_ascii_case(b"get") {
+            get = true;
+        } else if option.eq_ignore_ascii_case(b"keepttl") {
+            if expiry.is_some() {
+                return None;
+            }
+            ttl = TtlChoice::Keep;
+        } else {
             return None;
         }
-        let raw = options.get(index + 1).map(Vec::as_slice)?;
-        expiry = Some((unit, raw));
-        index += 2;
+        index += 1;
     }
 
-    Some(match expiry {
-        None => SetOptions::NoExpiry,
-        Some((unit, raw)) => SetOptions::Expiry { unit, raw },
+    Some(SetOptions {
+        condition,
+        ttl,
+        get,
+        expiry,
     })
 }
 
@@ -363,7 +416,7 @@ mod tests {
             Reply::Error("ERR wrong number of arguments for 'set' command".into())
         );
         assert_eq!(
-            run(&store, &[b"SET", b"k", b"v", b"KEEPTTL"]),
+            run(&store, &[b"SET", b"k", b"v", b"EXAT", b"10"]),
             Reply::Error("ERR syntax error".into())
         );
         // The rejected SET stored nothing.
@@ -463,11 +516,35 @@ mod tests {
         for parts in [
             &[b"SET".as_slice(), b"k", b"v", b"EX", b"10", b"PX", b"1000"][..],
             &[b"SET".as_slice(), b"k", b"v", b"PX", b"10", b"EX", b"1"][..],
-            &[b"SET".as_slice(), b"k", b"v", b"KEEPTTL"][..],
+            &[b"SET".as_slice(), b"k", b"v", b"NX", b"XX"][..],
+            &[b"SET".as_slice(), b"k", b"v", b"XX", b"NX"][..],
+            &[b"SET".as_slice(), b"k", b"v", b"KEEPTTL", b"EX", b"10"][..],
+            &[b"SET".as_slice(), b"k", b"v", b"EX", b"10", b"KEEPTTL"][..],
+            &[b"SET".as_slice(), b"k", b"v", b"EXAT", b"10"][..],
+            &[b"SET".as_slice(), b"k", b"v", b"PXAT", b"10"][..],
+            &[b"SET".as_slice(), b"k", b"v", b"FOO"][..],
             &[b"SET".as_slice(), b"k", b"v", b"EX"][..],
         ] {
             assert_eq!(run_at(&store, parts, now), syntax, "{parts:?}");
         }
+
+        // Duplicate flags are accepted, as in Redis.
+        assert_eq!(
+            run_at(&store, &[b"SET", b"dup-nx", b"v", b"NX", b"NX"], now),
+            Reply::Simple("OK")
+        );
+        assert_eq!(
+            run_at(&store, &[b"SET", b"dup-nx", b"v2", b"GET", b"GET"], now),
+            bulk(b"v")
+        );
+        assert_eq!(
+            run_at(
+                &store,
+                &[b"SET", b"dup-nx", b"v3", b"KEEPTTL", b"KEEPTTL"],
+                now
+            ),
+            Reply::Simple("OK")
+        );
 
         assert_eq!(
             run_at(&store, &[b"SET", b"k", b"v", b"EX", b"abc"], now),
@@ -495,6 +572,167 @@ mod tests {
             run_at(&store, &[b"SET", b"k", b"v", b"EX", b"PX", b"10"], now),
             syntax
         );
+    }
+
+    #[test]
+    fn set_nx_and_xx_gate_writes() {
+        let store = Store::new();
+
+        assert_eq!(
+            run(&store, &[b"SET", b"k", b"v", b"NX"]),
+            Reply::Simple("OK")
+        );
+        assert_eq!(
+            run(&store, &[b"SET", b"k", b"other", b"NX"]),
+            Reply::Bulk(None)
+        );
+        assert_eq!(run(&store, &[b"GET", b"k"]), bulk(b"v"));
+
+        assert_eq!(
+            run(&store, &[b"SET", b"k", b"other", b"XX"]),
+            Reply::Simple("OK")
+        );
+        assert_eq!(run(&store, &[b"GET", b"k"]), bulk(b"other"));
+
+        assert_eq!(
+            run(&store, &[b"SET", b"missing", b"v", b"XX"]),
+            Reply::Bulk(None)
+        );
+        assert_eq!(run(&store, &[b"GET", b"missing"]), Reply::Bulk(None));
+    }
+
+    #[test]
+    fn set_nx_treats_an_expired_key_as_absent() {
+        let store = Store::new();
+        let now = Instant::now();
+
+        run_at(&store, &[b"SET", b"k", b"dead", b"PX", b"100"], now);
+        assert_eq!(
+            run_at(&store, &[b"SET", b"k", b"fresh", b"NX"], at(now, 1)),
+            Reply::Simple("OK")
+        );
+        assert_eq!(run_at(&store, &[b"GET", b"k"], at(now, 1)), bulk(b"fresh"));
+    }
+
+    #[test]
+    fn set_get_returns_the_previous_value_and_not_ok() {
+        let store = Store::new();
+
+        assert_eq!(
+            run(&store, &[b"SET", b"k", b"v", b"GET"]),
+            Reply::Bulk(None)
+        );
+        assert_eq!(run(&store, &[b"GET", b"k"]), bulk(b"v"));
+
+        assert_eq!(run(&store, &[b"SET", b"k", b"other", b"GET"]), bulk(b"v"));
+        assert_eq!(run(&store, &[b"GET", b"k"]), bulk(b"other"));
+    }
+
+    #[test]
+    fn set_nx_get_returns_the_old_value_without_writing() {
+        let store = Store::new();
+        run(&store, &[b"SET", b"k", b"v"]);
+
+        assert_eq!(
+            run(&store, &[b"SET", b"k", b"other", b"NX", b"GET"]),
+            bulk(b"v")
+        );
+        assert_eq!(run(&store, &[b"GET", b"k"]), bulk(b"v"));
+
+        // XX on a missing key replies nil even with GET.
+        assert_eq!(
+            run(&store, &[b"SET", b"missing", b"other", b"XX", b"GET"]),
+            Reply::Bulk(None)
+        );
+        assert_eq!(run(&store, &[b"GET", b"missing"]), Reply::Bulk(None));
+
+        // XX GET on a live key returns the old value and writes.
+        assert_eq!(
+            run(&store, &[b"SET", b"k", b"third", b"XX", b"GET"]),
+            bulk(b"v")
+        );
+        assert_eq!(run(&store, &[b"GET", b"k"]), bulk(b"third"));
+    }
+
+    #[test]
+    fn set_keepttl_preserves_a_deadline_and_plain_set_clears_it() {
+        let store = Store::new();
+        let now = Instant::now();
+
+        run_at(&store, &[b"SET", b"k", b"v", b"PX", b"1500"], now);
+        assert_eq!(
+            run_at(&store, &[b"SET", b"k", b"other", b"KEEPTTL"], now),
+            Reply::Simple("OK")
+        );
+        assert_eq!(run_at(&store, &[b"PTTL", b"k"], now), Reply::Integer(1500));
+
+        assert_eq!(
+            run_at(&store, &[b"SET", b"new", b"v", b"KEEPTTL"], now),
+            Reply::Simple("OK")
+        );
+        assert_eq!(run_at(&store, &[b"TTL", b"new"], now), Reply::Integer(-1));
+
+        assert_eq!(
+            run_at(&store, &[b"SET", b"k", b"fresh"], now),
+            Reply::Simple("OK")
+        );
+        assert_eq!(run_at(&store, &[b"TTL", b"k"], now), Reply::Integer(-1));
+    }
+
+    #[test]
+    fn set_conditions_gate_the_deadline_too() {
+        let store = Store::new();
+        let now = Instant::now();
+
+        // NX + PX on an existing key: no write and no TTL change.
+        run_at(&store, &[b"SET", b"k", b"v", b"EX", b"10"], now);
+        assert_eq!(
+            run_at(&store, &[b"SET", b"k", b"other", b"NX", b"PX", b"99"], now),
+            Reply::Bulk(None)
+        );
+        assert_eq!(run_at(&store, &[b"GET", b"k"], now), bulk(b"v"));
+        assert_eq!(run_at(&store, &[b"TTL", b"k"], now), Reply::Integer(10));
+
+        // NX + PX on a missing key installs the new deadline.
+        assert_eq!(
+            run_at(
+                &store,
+                &[b"SET", b"missing", b"v", b"NX", b"PX", b"1500"],
+                now
+            ),
+            Reply::Simple("OK")
+        );
+        assert_eq!(
+            run_at(&store, &[b"PTTL", b"missing"], now),
+            Reply::Integer(1500)
+        );
+
+        // XX + EX on a missing key creates nothing.
+        assert_eq!(
+            run_at(&store, &[b"SET", b"absent", b"v", b"XX", b"EX", b"10"], now),
+            Reply::Bulk(None)
+        );
+        assert_eq!(
+            run_at(&store, &[b"EXISTS", b"absent"], now),
+            Reply::Integer(0)
+        );
+    }
+
+    #[test]
+    fn set_expiry_errors_win_over_a_failing_condition() {
+        let store = Store::new();
+        let now = Instant::now();
+        run_at(&store, &[b"SET", b"k", b"v"], now);
+
+        assert_eq!(
+            run_at(&store, &[b"SET", b"k", b"other", b"EX", b"0", b"NX"], now),
+            Reply::Error("ERR invalid expire time in 'set' command".into())
+        );
+        assert_eq!(
+            run_at(&store, &[b"SET", b"k", b"other", b"EX", b"abc", b"NX"], now),
+            Reply::Error("ERR value is not an integer or out of range".into())
+        );
+        assert_eq!(run_at(&store, &[b"GET", b"k"], now), bulk(b"v"));
     }
 
     #[test]
